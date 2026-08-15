@@ -1,0 +1,54 @@
+//@version=5
+strategy("🥔 Potato S&R Trend-Gated Strategy", overlay=true, initial_capital=14, default_qty_type=strategy.percent_of_equity, default_qty_value=150)
+
+// ==============================================================================
+// 🥔 THE "POTATO" SUPPORT & RESISTANCE STRATEGY (VICE-VERSA S/R TARGETS)
+// ==============================================================================
+// 1. Check Trend Bias: (EMA 200 Macro Trend)
+//    - Uptrend: Buys Only (Tap Floor -> Take Profit at Ceiling 🧱)
+//    - Downtrend: Sells Only (Tap Ceiling -> Take Profit at Floor 🛡️)
+// ==============================================================================
+
+// 1. Inputs & Filters
+leftBars = input.int(15, "Swing High/Low Left Lookback", minval=5)
+rightBars = input.int(5, "Swing High/Low Right Lookback", minval=2)
+trendEmaLen = input.int(200, "Macro Trend EMA Length")
+
+macroEma = ta.ema(close, trendEmaLen)
+plot(macroEma, "Macro Trend EMA (200)", color=color.new(color.yellow, 20), linewidth=2)
+
+// 2. Pure Swing High & Swing Low Detection (Floors & Ceilings)
+pH = ta.pivothigh(high, leftBars, rightBars)
+pL = ta.pivotlow(low, leftBars, rightBars)
+
+var float resistance = na
+var float support = na
+
+if not na(pH)
+    resistance := pH
+if not na(pL)
+    support := pL
+
+plot(resistance, "Ceiling (Resistance 🧱)", color=color.new(color.red, 10), linewidth=2, style=plot.style_linebr)
+plot(support, "Floor (Support 🛡️)", color=color.new(color.green, 10), linewidth=2, style=plot.style_linebr)
+
+// 3. Bounce Trigger Conditions
+atrVal = ta.atr(14)
+tapSupport = ta.crossover(close, support) or (low <= support and close > support)
+tapResistance = ta.crossunder(close, resistance) or (high >= resistance and close < resistance)
+
+isUptrend = close > macroEma
+isDowntrend = close < macroEma
+
+// 4. Execution Rules (Floor -> Ceiling TP / Ceiling -> Floor TP)
+if tapSupport and isUptrend and not na(support) and not na(resistance)
+    strategy.entry("Potato Long 🥔🟢", strategy.long)
+    sl = support - (0.5 * atrVal)
+    tp = resistance // Set Take Profit directly at the Resistance Ceiling 🧱
+    strategy.exit("Exit Long @ Ceiling", "Potato Long 🥔🟢", limit=tp, stop=sl)
+
+if tapResistance and isDowntrend and not na(resistance) and not na(support)
+    strategy.entry("Potato Short 🥔🔴", strategy.short)
+    sl = resistance + (0.5 * atrVal)
+    tp = support // Set Take Profit directly at the Support Floor 🛡️
+    strategy.exit("Exit Short @ Floor", "Potato Short 🥔🔴", limit=tp, stop=sl)

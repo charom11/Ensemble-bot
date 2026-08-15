@@ -1,0 +1,82 @@
+//@version=5
+strategy("⚡ RSI + CCI Dual Divergence Confluence Strategy", overlay=true, initial_capital=14, default_qty_type=strategy.percent_of_equity, default_qty_value=150)
+
+// ==============================================================================
+// ⚡ RSI + CCI DUAL DIVERGENCE QUANT ENGINE
+// ==============================================================================
+// Concept: 
+// 1. CCI (20) acts as the FAST / LEADING cyclical indicator (Statistical Deviation)
+// 2. RSI (14) acts as the SMOOTH / CONFIRMING momentum filter (Gain/Loss Ratio)
+// 3. Confluence Trigger: When BOTH RSI & CCI diverge at Support/Resistance Floor/Ceiling
+// ==============================================================================
+
+// 1. Inputs
+rsiLen = input.int(14, "RSI Length")
+cciLen = input.int(20, "CCI Length")
+leftBars = input.int(10, "Pivot Left Lookback")
+rightBars = input.int(4, "Pivot Right Lookback")
+macroEmaLen = input.int(200, "Macro Trend EMA Filter")
+
+// 2. Indicators Calculation
+rsiVal = ta.rsi(close, rsiLen)
+cciVal = ta.cci(close, cciLen)
+macroEma = ta.ema(close, macroEmaLen)
+
+plot(macroEma, "200 Macro Trend EMA", color=color.new(color.yellow, 20), linewidth=2)
+
+// 3. Horizontal Support & Resistance Pivots (Floors & Ceilings)
+pH = ta.pivothigh(high, leftBars, rightBars)
+pL = ta.pivotlow(low, leftBars, rightBars)
+
+var float resistance = na
+var float support = na
+
+if not na(pH)
+    resistance := pH
+if not na(pL)
+    support := pL
+
+plot(resistance, "Ceiling (Resistance 🧱)", color=color.new(color.red, 10), linewidth=2, style=plot.style_linebr)
+plot(support, "Floor (Support 🛡️)", color=color.new(color.green, 10), linewidth=2, style=plot.style_linebr)
+
+// 4. Divergence Detection Mechanics
+// Bullish Divergence: Price Lower Low, RSI Higher Low, CCI Higher Low from oversold
+pLow_prev = ta.valuewhen(not na(pL), low[rightBars], 1)
+rsi_prev = ta.valuewhen(not na(pL), rsiVal[rightBars], 1)
+cci_prev = ta.valuewhen(not na(pL), cciVal[rightBars], 1)
+
+bullRsiDiv = (not na(pL)) and (low[rightBars] < pLow_prev) and (rsiVal[rightBars] > rsi_prev) and (rsiVal[rightBars] < 45)
+bullCciDiv = (not na(pL)) and (low[rightBars] < pLow_prev) and (cciVal[rightBars] > cci_prev) and (cciVal[rightBars] < -80)
+dualBullDiv = bullRsiDiv and bullCciDiv
+
+// Bearish Divergence: Price Higher High, RSI Lower High, CCI Lower High from overbought
+pHigh_prev = ta.valuewhen(not na(pH), high[rightBars], 1)
+rsi_high_prev = ta.valuewhen(not na(pH), rsiVal[rightBars], 1)
+cci_high_prev = ta.valuewhen(not na(pH), cciVal[rightBars], 1)
+
+bearRsiDiv = (not na(pH)) and (high[rightBars] > pHigh_prev) and (rsiVal[rightBars] < rsi_high_prev) and (rsiVal[rightBars] > 55)
+bearCciDiv = (not na(pH)) and (high[rightBars] > pHigh_prev) and (cciVal[rightBars] < cci_high_prev) and (cciVal[rightBars] > 80)
+dualBearDiv = bearRsiDiv and bearCciDiv
+
+// 5. Visual Divergence Signals
+plotshape(dualBullDiv, "Dual Bullish Divergence 🚀", shape.triangleup, location.belowbar, color.green, size=size.normal, text="DUAL BULL DIV 🟢")
+plotshape(dualBearDiv, "Dual Bearish Divergence 💥", shape.triangledown, location.abovebar, color.red, size=size.normal, text="DUAL BEAR DIV 🔴")
+
+// 6. Automated Execution with Trend Bias Gate & Vice-Versa Targets
+atrVal = ta.atr(14)
+isUptrend = close > macroEma
+isDowntrend = close < macroEma
+
+// LONG @ SUPPORT WITH DIVERGENCE IN UPTREND
+if (dualBullDiv or (bullRsiDiv and low <= support * 1.004)) and isUptrend and not na(resistance)
+    strategy.entry("Dual Divergence Long 🟢", strategy.long)
+    sl = support - (0.5 * atrVal)
+    tp = resistance // Target: Resistance Ceiling 🧱
+    strategy.exit("TP @ Ceiling", "Dual Divergence Long 🟢", limit=tp, stop=sl)
+
+// SHORT @ RESISTANCE WITH DIVERGENCE IN DOWNTREND
+if (dualBearDiv or (bearRsiDiv and high >= resistance * 0.996)) and isDowntrend and not na(support)
+    strategy.entry("Dual Divergence Short 🔴", strategy.short)
+    sl = resistance + (0.5 * atrVal)
+    tp = support // Target: Support Floor 🛡️
+    strategy.exit("TP @ Floor", "Dual Divergence Short 🔴", limit=tp, stop=sl)
