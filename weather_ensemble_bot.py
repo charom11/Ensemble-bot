@@ -281,6 +281,79 @@ def check_potato_sr_levels(symbol="XRPUSDT"):
         return {'status': 'error', 'error': str(e), 'support': 0, 'resistance': 0, 'current_price': 0, 'state': 'ERROR'}
 
 # --------------------------------------------------------------------------
+# ⚡ Multi-Timeframe (5M, 15M, 1H, 4H) Dual RSI+CCI Divergence Scanner
+# --------------------------------------------------------------------------
+def get_mtf_divergence_matrix(symbol="XRPUSDT"):
+    """
+    ⚡ Multi-Timeframe (MTF) RSI(14) + CCI(20) Divergence Matrix:
+    - Scans 5m (Trigger), 15m (Structure), 1h (Swing), 4h (Macro)
+    - Detects 'The Bigger Picture' Institutional Reversals
+    """
+    intervals = ['5m', '15m', '1h', '4h']
+    matrix = {}
+    macro_bull = False
+    macro_bear = False
+    
+    def _fetch_div(tf):
+        try:
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={tf}&limit=45"
+            r = requests.get(url, timeout=2.5).json()
+            if not r or len(r) < 30:
+                return tf, {'state': 'NO_DATA', 'bull': False, 'bear': False, 'rsi': 50, 'cci': 0}
+            
+            closes = [float(k[4]) for k in r]
+            highs = [float(k[2]) for k in r]
+            lows = [float(k[3]) for k in r]
+            df = pd.DataFrame({'close': closes, 'high': highs, 'low': lows})
+            
+            div_state, bull, bear = WeatherEnsembleBot.calc_rsi_cci_divergence(df)
+            rsi_val = float(WeatherEnsembleBot.calc_rsi(pd.Series(closes), 14).iloc[-1])
+            cci_val = float(WeatherEnsembleBot.calc_cci(df, 20).iloc[-1])
+            
+            return tf, {
+                'state': div_state,
+                'bull': bull,
+                'bear': bear,
+                'rsi': round(rsi_val, 1),
+                'cci': round(cci_val, 1)
+            }
+        except Exception:
+            return tf, {'state': 'NO_DATA', 'bull': False, 'bear': False, 'rsi': 50, 'cci': 0}
+            
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(_fetch_div, tf) for tf in intervals]
+        for f in concurrent.futures.as_completed(futures):
+            tf, res = f.result()
+            matrix[tf] = res
+            if tf in ['1h', '4h']:
+                if res.get('bull'): macro_bull = True
+                if res.get('bear'): macro_bear = True
+                
+    # Evaluate Macro Alignment
+    confluence_grade = "STANDARD"
+    if macro_bull and matrix.get('5m', {}).get('bull'):
+        confluence_grade = "MACRO_SUPER_CONFLUENCE ⚡💎🟢 (4H/1H + 5M Bullish Alignment)"
+    elif macro_bear and matrix.get('5m', {}).get('bear'):
+        confluence_grade = "MACRO_SUPER_CONFLUENCE ⚡💎🔴 (4H/1H + 5M Bearish Alignment)"
+    elif macro_bull:
+        confluence_grade = "MACRO_BULL_DIVERGENCE 🏛️🟢 (Higher TF Institutional Accumulation)"
+    elif macro_bear:
+        confluence_grade = "MACRO_BEAR_DIVERGENCE 🏛️🔴 (Higher TF Institutional Distribution)"
+        
+    return {
+        'status': 'success',
+        'symbol': symbol,
+        'confluence_grade': confluence_grade,
+        'macro_bull': macro_bull,
+        'macro_bear': macro_bear,
+        'timeframes': matrix
+    }
+
+def get_divergence_status(symbol="XRPUSDT"):
+    return get_mtf_divergence_matrix(symbol)
+
+# --------------------------------------------------------------------------
 # 👑 BTC Master Beta Trend & Portfolio Exposure Risk Engines
 # --------------------------------------------------------------------------
 def check_btc_macro_health(target_side):
@@ -930,8 +1003,9 @@ QUANT_PILLAR_WEIGHTS = {
 }
 
 class WeatherEnsembleBot:
-    def __init__(self, consensus_threshold=30, live_trading=False, trade_usdt=None, margin_pct=0.03, sizing_mode="margin", leverage=50):
+    def __init__(self, consensus_threshold=30, live_trading=False, trade_usdt=None, margin_pct=0.03, sizing_mode="margin", leverage=50, timeframe="5m"):
         self.threshold = consensus_threshold
+        self.timeframe = timeframe # '1m', '3m', '5m', '15m', '1h', '4h'
         self.total_models = len(MODEL_NAMES)
         self.live_trading = live_trading
         self.trade_usdt = trade_usdt
@@ -1407,12 +1481,20 @@ class WeatherEnsembleBot:
                 f"• <b>/positions</b> - View all active Binance Futures open positions & PnL.\n"
                 f"• <b>/circuit</b> - View daily circuit breaker & drawdown status.\n"
                 f"• <b>/closeall</b> - Emergency market close all open futures positions.\n"
-                f"• <b>/models</b> - Real-time consensus breakdown for all 8 coins.\n"
-                f"• <b>/margin N</b> - Set capital risk percentage (e.g. <code>/margin 20</code>).\n"
-                f"• <b>/leverage N</b> - Set leverage multiplier (e.g. <code>/leverage 30</code>).\n"
+                f"• <b>/tf &lt;1m|3m|5m|15m|1h|4h&gt;</b> - Change execution timeframe.\n"
+                f"• <b>/models</b> - Real-time consensus breakdown for all 19 coins.\n"
+                f"• <b>/margin N</b> - Set capital risk percentage (e.g. <code>/margin 3</code>).\n"
+                f"• <b>/leverage N</b> - Set leverage multiplier (e.g. <code>/leverage 50</code>).\n"
                 f"• <b>/threshold N</b> - Set consensus threshold (e.g. <code>/threshold 30</code>)."
             )
             send_telegram_msg(help_msg, reply_markup=get_telegram_inline_keyboard())
+
+        elif cmd == '/tf':
+            if len(parts) > 1 and parts[1].lower() in ['1m', '3m', '5m', '15m', '30m', '1h', '4h']:
+                self.timeframe = parts[1].lower()
+                send_telegram_msg(f"⏱️ <b>EXECUTION TIMEFRAME SWITCHED</b>\n\nBot is now scanning <b>{self.timeframe.upper()}</b> bars for high-confluence setups!", reply_markup=get_telegram_inline_keyboard())
+            else:
+                send_telegram_msg(f"ℹ️ Current Execution Timeframe: <b>{self.timeframe.upper()}</b>\nUsage: <code>/tf 15m</code> (Supported: 1m, 3m, 5m, 15m, 1h, 4h)", reply_markup=get_telegram_inline_keyboard())
 
         elif cmd == '/status':
             usdt_bal = get_binance_futures_usdt_balance()
