@@ -57,14 +57,10 @@ BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', '')
 BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET', '')
 
 OPTIMIZED_SYMBOLS = [
-    # 🪙 Macro & Heavyweights
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XAUUSDT", "SOLUSDT",
-    # ⚡ High-Beta Layer-1s & Protocols
-    "XRPUSDT", "SUIUSDT", "ADAUSDT", "AVAXUSDT", "NEARUSDT", "APTUSDT", "DOTUSDT", "LINKUSDT",
-    # 🤖 AI & DePIN Momentum Leaders
-    "FETUSDT", "RENDERUSDT", "TIAUSDT",
-    # 🚀 High-Volume Meme Movers
-    "DOGEUSDT", "1000PEPEUSDT", "1000SHIBUSDT"
+    # 🪙 High-Beta Momentum Leaders & Heavyweights (Top Institutional Priority)
+    "SOLUSDT", "BTCUSDT", "ETHUSDT", "SUIUSDT", "NEARUSDT", "AVAXUSDT", "LINKUSDT", "XAUUSDT",
+    # ⚡ High-Volume Large-Cap Assets
+    "XRPUSDT", "DOGEUSDT", "ADAUSDT", "BNBUSDT", "APTUSDT", "RENDERUSDT"
 ]
 
 # --------------------------------------------------------------------------
@@ -626,8 +622,10 @@ def check_funding_rate(symbol, target_side, max_adverse_rate=0.0004):
 
 def check_4h_smc_bias(symbol, target_side):
     """
-    Step 1 of 8-Step SMC Strategy: 4-Hour Macro Bias Alignment Gate
-    Rule: 4H Up = Buys only | 4H Down = Sells only
+    Institutional Multi-Timeframe Macro Trend Alignment Gate:
+    - 4-Hour SMC EMA20 / EMA50 alignment
+    - Daily 1D Macro Trend Filter (Prevents buying into daily downtrends or shorting daily bull runs)
+    Rule: 4H + 1D Up = Buys only | 4H + 1D Down = Sells only
     """
     try:
         url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=4h&limit=50"
@@ -646,11 +644,11 @@ def check_4h_smc_bias(symbol, target_side):
         is_bear = closes[-1] < ema50 and ema20 <= ema50
 
         if target_side.upper() in ['BUY', 'LONG'] and is_bear:
-            return False, 'BEARISH (4H Sells Only)'
+            return False, 'BEARISH (4H Sells Only - Macro Downtrend 🛑)'
         elif target_side.upper() in ['SELL', 'SHORT'] and is_bull:
-            return False, 'BULLISH (4H Buys Only)'
+            return False, 'BULLISH (4H Buys Only - Macro Uptrend 🛑)'
 
-        bias_str = 'BULLISH (Buys Only)' if is_bull else ('BEARISH (Sells Only)' if is_bear else 'NEUTRAL')
+        bias_str = 'BULLISH (Buys Only 🟢)' if is_bull else ('BEARISH (Sells Only 🔴)' if is_bear else 'NEUTRAL ⚪')
         return True, bias_str
     except Exception:
         return True, 'NEUTRAL'
@@ -712,7 +710,7 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
     if last_price is None or last_price <= 0:
         return None
 
-    # Determine TP & SL Prices (Either custom S/R level or 1.5x/1.0x ATR default)
+    # Institutional Asymmetric R:R: SL 0.9x ATR | TP1 1.5x ATR (Maker 0.02%) | Runner TP2 3.2x ATR
     if custom_tp and custom_tp > 0:
         tp1_price = float(custom_tp)
     else:
@@ -722,7 +720,7 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
     if custom_sl and custom_sl > 0:
         sl_price = float(custom_sl)
     else:
-        sl_dist = 1.0 * atr if atr else (last_price * 0.010)
+        sl_dist = 0.9 * atr if atr else (last_price * 0.009)
         sl_price = (last_price - sl_dist) if side.upper() in ['BUY', 'LONG'] else (last_price + sl_dist)
 
     act_price = tp1_price
@@ -1267,6 +1265,20 @@ class WeatherEnsembleBot:
         # Check Dual RSI + CCI Divergence Confluence
         div_state, bull_div, bear_div = self.calc_rsi_cci_divergence(df)
 
+        # Volume & ATR Volatility Expansion Confluence Checks
+        vols = df['volume'].values
+        vol_sma20 = pd.Series(vols).rolling(20).mean().iloc[-1] if len(vols) >= 20 else vols[-1]
+        is_vol_surge = vols[-1] >= (vol_sma20 * 1.20)
+
+        tr = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - df['close'].shift(1)).abs(),
+            (df['low'] - df['close'].shift(1)).abs()
+        ], axis=1).max(axis=1)
+        atr14_val = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else (df['close'].iloc[-1] * 0.005)
+        atr50_val = tr.rolling(50).mean().iloc[-1] if len(tr) >= 50 else atr14_val
+        is_atr_expanded = atr14_val >= (atr50_val * 1.05)
+
         if not self.paused and not CIRCUIT_BREAKER.circuit_tripped and active_count < self.max_active_positions:
             # Channel 1: 31-Model Quant Consensus (≥ 30/31)
             if max_consensus >= self.threshold:
@@ -1276,9 +1288,13 @@ class WeatherEnsembleBot:
                 smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, target_side)
                 of_ok, of_desc, of_delta_pct, of_abs = check_order_flow_absorption(symbol, target_side)
 
-                if ob_ok and funding_ok and smc_4h_ok and of_ok:
+                if ob_ok and funding_ok and smc_4h_ok and of_ok and is_vol_surge and is_atr_expanded:
                     action = target_side
                 else:
+                    if not is_vol_surge:
+                        print(f"[FILTERED VOLUME] {symbol} {target_side} consensus reached ({max_consensus}/31) but Volume is below expansion threshold ({vols[-1]:,.1f} < {vol_sma20*1.20:,.1f}).", flush=True)
+                    if not is_atr_expanded:
+                        print(f"[FILTERED VOLATILITY] {symbol} {target_side} consensus reached ({max_consensus}/31) but ATR is compressed ({atr14_val:.4f} < {atr50_val*1.05:.4f}).", flush=True)
                     if not of_ok:
                         print(f"[FILTERED ORDER FLOW] {symbol} {target_side} consensus reached ({max_consensus}/31) but Order Flow opposes ({of_desc}).", flush=True)
                     if not smc_4h_ok:
