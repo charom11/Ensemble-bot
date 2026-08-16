@@ -1485,6 +1485,7 @@ class WeatherEnsembleBot:
                 f"• <b>/models</b> - Real-time consensus breakdown for all 19 coins.\n"
                 f"• <b>/margin N</b> - Set capital risk percentage (e.g. <code>/margin 3</code>).\n"
                 f"• <b>/leverage N</b> - Set leverage multiplier (e.g. <code>/leverage 50</code>).\n"
+                f"• <b>/maxpos N</b> - Set max concurrent positions (e.g. <code>/maxpos 2</code>).\n"
                 f"• <b>/threshold N</b> - Set consensus threshold (e.g. <code>/threshold 30</code>)."
             )
             send_telegram_msg(help_msg, reply_markup=get_telegram_inline_keyboard())
@@ -1585,6 +1586,17 @@ class WeatherEnsembleBot:
                         send_telegram_msg(f"✅ <b>Position Risk updated to {self.margin_pct * 100:.1f}%!</b>", reply_markup=get_telegram_inline_keyboard())
                 except ValueError:
                     send_telegram_msg("Usage: <code>/margin 20</code>")
+
+        elif cmd in ['/maxpos', '/maxpositions', '/slots']:
+            if len(parts) > 1 and parts[1].isdigit():
+                val = int(parts[1])
+                if 1 <= val <= 20:
+                    self.max_active_positions = val
+                    send_telegram_msg(f"✅ <b>Max Active Positions updated to {self.max_active_positions}!</b>", reply_markup=get_telegram_inline_keyboard())
+                else:
+                    send_telegram_msg("⚠️ Max active positions must be between 1 and 20.")
+            else:
+                send_telegram_msg(f"ℹ️ Current Max Active Positions: <b>{self.max_active_positions}</b>\nUsage: <code>/maxpos 2</code>", reply_markup=get_telegram_inline_keyboard())
 
         elif cmd == '/models':
             lines = ["<b>31-MODEL REAL-TIME CONSENSUS MATRIX</b>\n"]
