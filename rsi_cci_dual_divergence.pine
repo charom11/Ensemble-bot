@@ -62,21 +62,41 @@ dualBearDiv = bearRsiDiv and bearCciDiv
 plotshape(dualBullDiv, "Dual Bullish Divergence 🚀", shape.triangleup, location.belowbar, color.green, size=size.normal, text="DUAL BULL DIV 🟢")
 plotshape(dualBearDiv, "Dual Bearish Divergence 💥", shape.triangledown, location.abovebar, color.red, size=size.normal, text="DUAL BEAR DIV 🔴")
 
-// 6. Automated Execution with Trend Bias Gate & Vice-Versa Targets
-atrVal = ta.atr(14)
-isUptrend = close > macroEma
-isDowntrend = close < macroEma
+// 7. Multi-Timeframe (MTF) Macro Divergence Table HUD (5M, 15M, 1H, 4H)
+htf1_close = request.security(syminfo.tickerid, "15", close)
+htf1_rsi = request.security(syminfo.tickerid, "15", ta.rsi(close, 14))
+htf1_cci = request.security(syminfo.tickerid, "15", ta.cci(close, 20))
 
-// LONG @ SUPPORT WITH DIVERGENCE IN UPTREND
-if (dualBullDiv or (bullRsiDiv and low <= support * 1.004)) and isUptrend and not na(resistance)
-    strategy.entry("Dual Divergence Long 🟢", strategy.long)
-    sl = support - (0.5 * atrVal)
-    tp = resistance // Target: Resistance Ceiling 🧱
-    strategy.exit("TP @ Ceiling", "Dual Divergence Long 🟢", limit=tp, stop=sl)
+htf2_close = request.security(syminfo.tickerid, "60", close)
+htf2_rsi = request.security(syminfo.tickerid, "60", ta.rsi(close, 14))
+htf2_cci = request.security(syminfo.tickerid, "60", ta.cci(close, 20))
 
-// SHORT @ RESISTANCE WITH DIVERGENCE IN DOWNTREND
-if (dualBearDiv or (bearRsiDiv and high >= resistance * 0.996)) and isDowntrend and not na(support)
-    strategy.entry("Dual Divergence Short 🔴", strategy.short)
-    sl = resistance + (0.5 * atrVal)
-    tp = support // Target: Support Floor 🛡️
-    strategy.exit("TP @ Floor", "Dual Divergence Short 🔴", limit=tp, stop=sl)
+htf3_close = request.security(syminfo.tickerid, "240", close)
+htf3_rsi = request.security(syminfo.tickerid, "240", ta.rsi(close, 14))
+htf3_cci = request.security(syminfo.tickerid, "240", ta.cci(close, 20))
+
+var table mtfTable = table.new(position.top_right, 5, 4, bgcolor=color.new(#0c0e14, 15), border_width=1, border_color=color.gray)
+if barstate.islast
+    table.cell(mtfTable, 0, 0, "TIMEFRAME", bgcolor=#161b26, text_color=color.aqua, text_size=size.small)
+    table.cell(mtfTable, 1, 0, "RSI (14)", bgcolor=#161b26, text_color=color.aqua, text_size=size.small)
+    table.cell(mtfTable, 2, 0, "CCI (20)", bgcolor=#161b26, text_color=color.aqua, text_size=size.small)
+    table.cell(mtfTable, 3, 0, "DIVERGENCE", bgcolor=#161b26, text_color=color.aqua, text_size=size.small)
+    table.cell(mtfTable, 4, 0, "MACRO BIAS", bgcolor=#161b26, text_color=color.aqua, text_size=size.small)
+
+    table.cell(mtfTable, 0, 1, "5M (Trigger)", text_color=color.white, text_size=size.small)
+    table.cell(mtfTable, 1, 1, str.tostring(math.round(rsiVal, 1)), text_color=rsiVal > 50 ? color.green : color.red, text_size=size.small)
+    table.cell(mtfTable, 2, 1, str.tostring(math.round(cciVal, 1)), text_color=cciVal > 0 ? color.green : color.red, text_size=size.small)
+    table.cell(mtfTable, 3, 1, dualBullDiv ? "DUAL BULL 🟢" : (dualBearDiv ? "DUAL BEAR 🔴" : "NEUTRAL"), text_color=dualBullDiv ? color.green : (dualBearDiv ? color.red : color.gray), text_size=size.small)
+    table.cell(mtfTable, 4, 1, isUptrend ? "BULLISH 🟢" : "BEARISH 🔴", text_color=isUptrend ? color.green : color.red, text_size=size.small)
+
+    table.cell(mtfTable, 0, 2, "1H (Swing)", text_color=color.white, text_size=size.small)
+    table.cell(mtfTable, 1, 2, str.tostring(math.round(htf2_rsi, 1)), text_color=htf2_rsi > 50 ? color.green : color.red, text_size=size.small)
+    table.cell(mtfTable, 2, 2, str.tostring(math.round(htf2_cci, 1)), text_color=htf2_cci > 0 ? color.green : color.red, text_size=size.small)
+    table.cell(mtfTable, 3, 2, htf2_rsi < 35 and htf2_cci > -100 ? "BULL DIV 🟢" : (htf2_rsi > 65 and htf2_cci < 100 ? "BEAR DIV 🔴" : "NEUTRAL"), text_color=htf2_rsi < 35 ? color.green : (htf2_rsi > 65 ? color.red : color.gray), text_size=size.small)
+    table.cell(mtfTable, 4, 2, htf2_close > macroEma ? "BULLISH 🟢" : "BEARISH 🔴", text_color=htf2_close > macroEma ? color.green : color.red, text_size=size.small)
+
+    table.cell(mtfTable, 0, 3, "4H (Macro)", text_color=color.white, text_size=size.small)
+    table.cell(mtfTable, 1, 3, str.tostring(math.round(htf3_rsi, 1)), text_color=htf3_rsi > 50 ? color.green : color.red, text_size=size.small)
+    table.cell(mtfTable, 2, 3, str.tostring(math.round(htf3_cci, 1)), text_color=htf3_cci > 0 ? color.green : color.red, text_size=size.small)
+    table.cell(mtfTable, 3, 3, htf3_rsi < 35 and htf3_cci > -100 ? "MACRO BULL 🏛️🟢" : (htf3_rsi > 65 and htf3_cci < 100 ? "MACRO BEAR 🏛️🔴" : "NEUTRAL"), text_color=htf3_rsi < 35 ? color.green : (htf3_rsi > 65 ? color.red : color.gray), text_size=size.small)
+    table.cell(mtfTable, 4, 3, htf3_close > macroEma ? "BULLISH 🟢" : "BEARISH 🔴", text_color=htf3_close > macroEma ? color.green : color.red, text_size=size.small)
