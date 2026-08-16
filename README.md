@@ -104,9 +104,13 @@ python weather_ensemble_bot.py --trade-live --leverage 20 --sizing-mode margin -
 
 #### Interactive Telegram Remote Commands
 - `/status` — View current account balance, active positions, leverage, and engine state.
+- `/positions` — View live open positions, entry prices, liquidation, and unrealized PnL.
+- `/maxpos <N>` — Set maximum concurrent open positions (e.g. `/maxpos 2`).
 - `/models` — Real-time 31-model vote breakdown across monitored coins.
 - `/threshold 29` — Dynamically update the consensus threshold on the fly.
 - `/leverage 20` — Dynamically adjust the futures leverage factor.
+- `/margin 5` — Dynamically adjust the margin risk % per trade.
+- `/closeall` — Emergency market close all open futures positions.
 - `/pause` / `/resume` — Instantly pause or resume autonomous trade execution.
 
 ---

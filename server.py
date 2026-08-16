@@ -139,9 +139,23 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
     def handle_api_status(self):
         global BOT_PROCESS
         is_running = BOT_PROCESS is not None and BOT_PROCESS.poll() is None
+        pid = BOT_PROCESS.pid if is_running else None
+        
+        if not is_running:
+            try:
+                import psutil
+                for p in psutil.process_iter(['pid', 'cmdline']):
+                    cmd = p.info.get('cmdline') or []
+                    if any('weather_ensemble_bot.py' in str(arg) for arg in cmd):
+                        is_running = True
+                        pid = p.info.get('pid')
+                        break
+            except Exception:
+                pass
+
         data = {
             'running': is_running,
-            'pid': BOT_PROCESS.pid if is_running else None
+            'pid': pid
         }
         self.send_json_response(200, data)
 
