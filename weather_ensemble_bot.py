@@ -873,8 +873,17 @@ def place_binance_futures_market_order(symbol="XRPUSDT", side="BUY", trade_usdt=
     print(f"[BINANCE LIVE ORDER] {symbol} {side} | Margin: ${margin_usdt:.2f} | Notional: ${notional_usdt:.2f} ({leverage}x) | Qty: {qty}")
     res = binance_futures_signed_request('POST', '/fapi/v1/order', params)
 
-    if isinstance(res, dict) and 'orderId' in res and atr is not None:
-        tp_sl_info = place_binance_futures_tp_sl(symbol=symbol, side=side, last_price=last_price, atr=atr, leverage=leverage, total_qty=qty)
+    if isinstance(res, dict) and 'orderId' in res and (atr is not None or custom_tp is not None or custom_sl is not None):
+        tp_sl_info = place_binance_futures_tp_sl(
+            symbol=symbol,
+            side=side,
+            last_price=last_price,
+            atr=atr,
+            leverage=leverage,
+            total_qty=qty,
+            custom_tp=custom_tp,
+            custom_sl=custom_sl
+        )
         res['tp_sl'] = tp_sl_info
 
     return res
@@ -1459,6 +1468,11 @@ class WeatherEnsembleBot:
                             # 1. Handle Inline Button Clicks
                             if "callback_query" in update:
                                 cb = update["callback_query"]
+                                sender_id = str(cb.get("from", {}).get("id", ""))
+                                message_chat_id = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+                                if TELEGRAM_CHAT_ID and sender_id != str(TELEGRAM_CHAT_ID) and message_chat_id != str(TELEGRAM_CHAT_ID):
+                                    continue
+
                                 cmd = cb.get("data", "")
                                 cb_id = cb.get("id")
                                 try:
@@ -1475,6 +1489,11 @@ class WeatherEnsembleBot:
                             # 2. Handle Text Messages
                             elif "message" in update:
                                 message = update.get("message", {})
+                                sender_id = str(message.get("from", {}).get("id", ""))
+                                chat_id = str(message.get("chat", {}).get("id", ""))
+                                if TELEGRAM_CHAT_ID and sender_id != str(TELEGRAM_CHAT_ID) and chat_id != str(TELEGRAM_CHAT_ID):
+                                    continue
+
                                 text = message.get("text", "").strip()
                                 if text:
                                     self.handle_telegram_command(text)
