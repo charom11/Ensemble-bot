@@ -60,27 +60,37 @@ def run_1year_backtest():
     monthly_balances = {}
     
     base_prices = {
-        'XAUUSDT': 2650.0,
-        'XRPUSDT': 1.00,
-        'SUIUSDT': 3.20,
-        'DOGEUSDT': 0.25,
-        'ADAUSDT': 0.70,
-        'LINKUSDT': 18.50,
-        'NEARUSDT': 5.80,
+        'BTCUSDT': 65000.0,
+        'ETHUSDT': 3400.0,
         'SOLUSDT': 195.0,
-        'AVAXUSDT': 32.0
+        'XAUUSDT': 2650.0,
+        'BNBUSDT': 580.0,
+        'SUIUSDT': 3.20,
+        'NEARUSDT': 5.80,
+        'AVAXUSDT': 32.0,
+        'LINKUSDT': 18.50,
+        'APTUSDT': 9.50,
+        'RENDERUSDT': 6.20,
+        'XRPUSDT': 1.00,
+        'DOGEUSDT': 0.25,
+        'ADAUSDT': 0.70
     }
     
     volatilities = {
-        'XAUUSDT': 0.015,
-        'XRPUSDT': 0.038,
-        'SUIUSDT': 0.045,
-        'DOGEUSDT': 0.042,
-        'ADAUSDT': 0.035,
-        'LINKUSDT': 0.032,
-        'NEARUSDT': 0.040,
+        'BTCUSDT': 0.022,
+        'ETHUSDT': 0.028,
         'SOLUSDT': 0.038,
-        'AVAXUSDT': 0.036
+        'XAUUSDT': 0.015,
+        'BNBUSDT': 0.025,
+        'SUIUSDT': 0.045,
+        'NEARUSDT': 0.040,
+        'AVAXUSDT': 0.036,
+        'LINKUSDT': 0.032,
+        'APTUSDT': 0.040,
+        'RENDERUSDT': 0.045,
+        'XRPUSDT': 0.038,
+        'DOGEUSDT': 0.042,
+        'ADAUSDT': 0.035
     }
     
     print("[1/3] Generating historical market cycles across 9 assets...")

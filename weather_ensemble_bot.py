@@ -1010,7 +1010,7 @@ QUANT_PILLAR_WEIGHTS = {
 }
 
 class WeatherEnsembleBot:
-    def __init__(self, consensus_threshold=30, live_trading=False, trade_usdt=None, margin_pct=0.03, sizing_mode="margin", leverage=50, timeframe="5m"):
+    def __init__(self, consensus_threshold=30, live_trading=False, trade_usdt=None, margin_pct=0.03, sizing_mode="margin", leverage=50, timeframe="15m"):
         self.threshold = consensus_threshold
         self.timeframe = timeframe # '1m', '3m', '5m', '15m', '1h', '4h'
         self.total_models = len(MODEL_NAMES)
@@ -1421,7 +1421,9 @@ class WeatherEnsembleBot:
 
         return entry
 
-    def fetch_binance_klines(self, symbol="XRPUSDT", interval="5m", limit=100):
+    def fetch_binance_klines(self, symbol="XRPUSDT", interval=None, limit=100):
+        if interval is None:
+            interval = self.timeframe
         url = "https://fapi.binance.com/fapi/v1/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit}
         try:
@@ -1729,6 +1731,7 @@ if __name__ == '__main__':
     parser.add_argument('--sizing-mode', type=str, choices=['notional', 'margin'], default='margin')
     parser.add_argument('--leverage', type=int, default=50, help='Leverage multiplier (default 50x)')
     parser.add_argument('--threshold', type=int, default=30, help='Consensus threshold (default 30/31)')
+    parser.add_argument('--timeframe', type=str, default='15m', help='Execution timeframe (default 15m)')
     args = parser.parse_args()
 
     bot = WeatherEnsembleBot(
@@ -1737,7 +1740,8 @@ if __name__ == '__main__':
         trade_usdt=args.usdt,
         margin_pct=args.margin_pct,
         sizing_mode=args.sizing_mode,
-        leverage=args.leverage
+        leverage=args.leverage,
+        timeframe=args.timeframe
     )
     try:
         bot.run_multi_asset_live_loop()

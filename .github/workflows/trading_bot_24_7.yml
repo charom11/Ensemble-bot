@@ -42,4 +42,4 @@ jobs:
           TELEGRAM_NOTIFICATIONS: 'true'
         run: |
           echo "Starting 24/7 Live Trading Session on GitHub Actions..."
-          python -u weather_ensemble_bot.py --trade-live --sizing-mode margin --margin-pct 0.03 --leverage 50 --threshold 30
+          python -u weather_ensemble_bot.py --trade-live --sizing-mode margin --margin-pct 0.03 --leverage 50 --threshold 30 --timeframe 15m

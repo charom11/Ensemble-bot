@@ -24,4 +24,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:8080/api/status || exit 1
 
 # Start both server and bot in 24/7 self-healing mode
-CMD ["python", "weather_ensemble_bot.py", "--trade-live", "--sizing-mode", "margin", "--margin-pct", "0.03", "--leverage", "50", "--threshold", "30"]
+CMD ["python", "weather_ensemble_bot.py", "--trade-live", "--sizing-mode", "margin", "--margin-pct", "0.03", "--leverage", "50", "--threshold", "30", "--timeframe", "15m"]
