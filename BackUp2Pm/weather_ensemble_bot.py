@@ -923,17 +923,14 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
     sl_str = f"{sl_price:.{price_prec}f}"
     act_str = f"{act_price:.{price_prec}f}"
 
-    # Determine 50% scale-out quantity for Option B
-    half_qty = round(total_qty * 0.5, qty_prec) if (total_qty and total_qty > 0) else None
-    if qty_prec == 0 and half_qty:
-        half_qty = int(half_qty)
+    half_qty_str = None
+    if total_qty and total_qty > 0:
+        half_qty = round(total_qty * 0.5, qty_prec)
+        if qty_prec == 0:
+            half_qty = int(half_qty)
+        half_qty_str = str(half_qty)
 
-    # If 50% size meets Binance $5.00 min notional, place TP1 for 50% of position
-    # Otherwise, place TP1 for full size
-    tp1_qty = half_qty if (half_qty and (half_qty * last_price >= 5.05)) else total_qty
-    tp1_qty_str = str(int(tp1_qty)) if qty_prec == 0 else f"{tp1_qty:.{qty_prec}f}"
-
-    # 1. Take Profit Order (50% scale-out @ TP1 on Binance Conditional Orders)
+    # 1. Take Profit Order (Native TAKE_PROFIT_MARKET on Binance Conditional Orders)
     tp_res = None
     sl_res = None
     try:
@@ -946,17 +943,17 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
         exchange.load_time_difference()
         ccxt_sym = symbol.replace('USDT', '/USDT:USDT')
         
-        # Place TP1 for 50% size
+        # Place Take Profit
         tp_order = exchange.create_order(
             symbol=ccxt_sym,
             type='TAKE_PROFIT_MARKET',
             side=close_side.lower(),
-            amount=float(tp1_qty_str),
+            amount=float(total_qty),
             params={'stopPrice': float(tp1_str), 'positionSide': position_side}
         )
-        tp_res = {'status': 'success', 'id': tp_order.get('id'), 'price': tp1_str, 'qty': tp1_qty_str}
+        tp_res = {'status': 'success', 'id': tp_order.get('id'), 'price': tp1_str}
         
-        # Place Initial Protective SL for full position
+        # Place Stop Loss
         sl_order = exchange.create_order(
             symbol=ccxt_sym,
             type='STOP_MARKET',
@@ -966,13 +963,13 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
         )
         sl_res = {'status': 'success', 'id': sl_order.get('id'), 'price': sl_str}
     except Exception as e:
-        # Fallback to direct signed API
+        # Fallback to direct signed API if CCXT has issues
         tp_params = {
             'symbol': symbol,
             'side': close_side,
             'type': 'TAKE_PROFIT_MARKET',
             'stopPrice': tp1_str,
-            'quantity': tp1_qty_str,
+            'closePosition': 'true',
             'positionSide': position_side
         }
         tp_res = binance_futures_signed_request('POST', '/fapi/v1/order', tp_params)
@@ -987,37 +984,30 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
         }
         sl_res = binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
 
-    # Record targets for Option B: Automated Breakeven & Dynamic TP2 Trailing Stop Daemon
+    # Record targets for automated Breakeven trailing stop daemon
     global ACTIVE_POSITION_TARGETS
     ACTIVE_POSITION_TARGETS[symbol] = {
         'side': side.upper(),
         'entry_price': last_price,
         'tp1': float(tp1_str),
         'sl': float(sl_str),
-        'current_sl': float(sl_str),
-        'initial_qty': float(total_qty),
-        'half_scaled': (tp1_qty < total_qty),
-        'atr': float(atr) if (atr and atr > 0) else float(last_price * 0.008),
-        'tp1_hit': False,
-        'highest_mark': last_price,
-        'lowest_mark': last_price,
-        'trailing_active': False
+        'qty': float(total_qty) if total_qty else 0.0,
+        'be_moved': False
     }
 
-    scale_desc = f"50% Scale-Out ({tp1_qty_str} Qty)" if (tp1_qty < total_qty) else f"100% Size ({total_qty} Qty)"
-    print(f"[ORDERS PLACED] {symbol} {side} | TP1 Target: ${tp1_str} [{scale_desc}] | SL: ${sl_str} (Option B + TP2 Trailing Stop Ready)", flush=True)
+    print(f"[ORDERS PLACED] {symbol} {side} | TP Target (Take Profit Market): ${tp1_str} | SL (Stop Market): ${sl_str}", flush=True)
     return {'tp_price': tp1_str, 'sl_price': sl_str, 'act_price': act_str, 'tp_res': tp_res, 'sl_res': sl_res}
 
 # --------------------------------------------------------------------------
-# Option B Engine: Real-Time Breakeven & Dynamic TP2 Trailing Stop Daemon
+# Automated Real-Time Breakeven & Trailing Stop Daemon
 # --------------------------------------------------------------------------
 ACTIVE_POSITION_TARGETS = {}
 
 def manage_active_positions_breakeven():
     """
-    Option B Engine: Real-Time Breakeven & Dynamic TP2 Trailing Stop Daemon:
-    1. Detects TP1 execution -> Shifts SL to Breakeven (+0.05% fee buffer).
-    2. Activates Dynamic Trailing Stop on the remaining 50% runner to ride super-trends!
+    Real-time Breakeven & Trailing Stop Daemon:
+    - Scans open positions on Binance every cycle
+    - When price crosses TP1 (0.000 Retest), automatically moves SL to Breakeven (entry_price + fee buffer)
     """
     global ACTIVE_POSITION_TARGETS
     try:
@@ -1036,153 +1026,60 @@ def manage_active_positions_breakeven():
                 continue
 
             target = ACTIVE_POSITION_TARGETS.get(sym)
-            if not target:
+            if not target or target.get('be_moved'):
                 continue
 
             side = 'LONG' if amt > 0 else 'SHORT'
             mark_p = float(p.get('markPrice', 0.0))
             entry_p = float(p.get('entryPrice', target.get('entry_price', 0.0)))
             tp1_p = target.get('tp1', 0.0)
-            atr_val = target.get('atr', entry_p * 0.008)
 
             if entry_p <= 0 or tp1_p <= 0:
                 continue
 
-            # PHASE 1: Detect TP1 Hit & Shift Stop Loss to Breakeven
-            if not target.get('tp1_hit'):
-                hit_tp1 = (side == 'LONG' and mark_p >= tp1_p) or (side == 'SHORT' and mark_p <= tp1_p) or (abs(amt) <= (target['initial_qty'] * 0.60))
-                if hit_tp1:
-                    price_prec, qty_prec = get_symbol_precision(sym)
-                    be_price = entry_p * 1.0005 if side == 'LONG' else entry_p * 0.9995
-                    be_str = f"{be_price:.{price_prec}f}"
-                    close_side = 'SELL' if side == 'LONG' else 'BUY'
+            # Check if price has reached or crossed TP1 level
+            hit_tp1 = (side == 'LONG' and mark_p >= tp1_p) or (side == 'SHORT' and mark_p <= tp1_p)
 
-                    # Cancel old initial SL order
-                    binance_futures_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': sym})
-
-                    # Place Breakeven Stop on remaining position
-                    try:
-                        import ccxt
-                        exchange = ccxt.binance({
-                            'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
-                            'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
-                            'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
-                        })
-                        exchange.load_time_difference()
-                        ccxt_sym = sym.replace('USDT', '/USDT:USDT')
-                        exchange.create_order(
-                            symbol=ccxt_sym,
-                            type='STOP_MARKET',
-                            side=close_side.lower(),
-                            amount=abs(amt),
-                            params={'stopPrice': float(be_str), 'positionSide': side}
-                        )
-                    except Exception:
-                        sl_params = {
-                            'symbol': sym,
-                            'side': close_side,
-                            'type': 'STOP_MARKET',
-                            'stopPrice': be_str,
-                            'closePosition': 'true',
-                            'positionSide': side
-                        }
-                        binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
-
-                    target['tp1_hit'] = True
-                    target['trailing_active'] = True
-                    target['current_sl'] = be_price
-                    target['highest_mark'] = mark_p
-                    target['lowest_mark'] = mark_p
-                    print(f"🎯 [TP1 50% SCALED OUT] #{sym} reached TP1! SL moved to Breakeven (${be_str}) — 100% Risk Free! TP2 Trailing Stop Engaged! 🚀", flush=True)
-                    send_telegram_msg(f"🎯 <b>TP1 SCALED OUT (50% PROFIT LOCKED)</b>\n\n• Asset: <b>#{sym}</b> ({side})\n• Mark Price: <b>${mark_p:,.4f}</b>\n• New Stop: <b>${be_str}</b> (Breakeven Locked 🔒)\n\n<i>🌊 Dynamic Trailing Stop activated for remaining 50% TP2 runner!</i>")
-                    continue
-
-            # PHASE 2: Dynamic TP2 Trailing Stop on the Remaining 50% Runner
-            if target.get('trailing_active'):
+            if hit_tp1:
+                # 1. Cancel old Stop Loss orders for this symbol
+                binance_futures_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': sym})
+                
+                # 2. Place new Stop Market at Breakeven (with 0.03% fee buffer)
                 price_prec, qty_prec = get_symbol_precision(sym)
+                be_price = entry_p * 1.0005 if side == 'LONG' else entry_p * 0.9995
+                be_str = f"{be_price:.{price_prec}f}"
                 close_side = 'SELL' if side == 'LONG' else 'BUY'
-                trail_distance = 1.2 * atr_val
 
-                if side == 'LONG':
-                    if mark_p > target['highest_mark']:
-                        target['highest_mark'] = mark_p
-                    
-                    calc_trail = target['highest_mark'] - trail_distance
-                    # Only move stop up, never down, and always at least at breakeven
-                    if calc_trail > (target['current_sl'] + (0.3 * atr_val)) and calc_trail > entry_p:
-                        trail_str = f"{calc_trail:.{price_prec}f}"
-                        binance_futures_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': sym})
-                        
-                        try:
-                            import ccxt
-                            exchange = ccxt.binance({
-                                'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
-                                'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
-                                'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
-                            })
-                            exchange.load_time_difference()
-                            ccxt_sym = sym.replace('USDT', '/USDT:USDT')
-                            exchange.create_order(
-                                symbol=ccxt_sym,
-                                type='STOP_MARKET',
-                                side=close_side.lower(),
-                                amount=abs(amt),
-                                params={'stopPrice': float(trail_str), 'positionSide': side}
-                            )
-                        except Exception:
-                            sl_params = {
-                                'symbol': sym,
-                                'side': close_side,
-                                'type': 'STOP_MARKET',
-                                'stopPrice': trail_str,
-                                'closePosition': 'true',
-                                'positionSide': side
-                            }
-                            binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
+                try:
+                    import ccxt
+                    exchange = ccxt.binance({
+                        'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
+                        'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
+                        'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+                    })
+                    exchange.load_time_difference()
+                    ccxt_sym = sym.replace('USDT', '/USDT:USDT')
+                    exchange.create_order(
+                        symbol=ccxt_sym,
+                        type='STOP_MARKET',
+                        side=close_side.lower(),
+                        amount=abs(amt),
+                        params={'stopPrice': float(be_str), 'positionSide': side}
+                    )
+                except Exception:
+                    sl_params = {
+                        'symbol': sym,
+                        'side': close_side,
+                        'type': 'STOP_MARKET',
+                        'stopPrice': be_str,
+                        'closePosition': 'true',
+                        'positionSide': side
+                    }
+                    binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
 
-                        target['current_sl'] = calc_trail
-                        print(f"📈 [TRAILING STOP TRAILED UP] #{sym} (LONG) -> New Stop Loss: ${trail_str} (Peak: ${target['highest_mark']:,.4f})", flush=True)
-
-                elif side == 'SHORT':
-                    if mark_p < target['lowest_mark']:
-                        target['lowest_mark'] = mark_p
-                    
-                    calc_trail = target['lowest_mark'] + trail_distance
-                    # Only move stop down, never up, and always at least at breakeven
-                    if calc_trail < (target['current_sl'] - (0.3 * atr_val)) and calc_trail < entry_p:
-                        trail_str = f"{calc_trail:.{price_prec}f}"
-                        binance_futures_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': sym})
-                        
-                        try:
-                            import ccxt
-                            exchange = ccxt.binance({
-                                'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
-                                'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
-                                'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
-                            })
-                            exchange.load_time_difference()
-                            ccxt_sym = sym.replace('USDT', '/USDT:USDT')
-                            exchange.create_order(
-                                symbol=ccxt_sym,
-                                type='STOP_MARKET',
-                                side=close_side.lower(),
-                                amount=abs(amt),
-                                params={'stopPrice': float(trail_str), 'positionSide': side}
-                            )
-                        except Exception:
-                            sl_params = {
-                                'symbol': sym,
-                                'side': close_side,
-                                'type': 'STOP_MARKET',
-                                'stopPrice': trail_str,
-                                'closePosition': 'true',
-                                'positionSide': side
-                            }
-                            binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
-
-                        target['current_sl'] = calc_trail
-                        print(f"📉 [TRAILING STOP TRAILED DOWN] #{sym} (SHORT) -> New Stop Loss: ${trail_str} (Trough: ${target['lowest_mark']:,.4f})", flush=True)
-
+                target['be_moved'] = True
+                print(f"🛡️ [BREAKEVEN ACTIVATED] #{sym} reached TP1! Protective SL moved to Entry (${be_str}) — Guaranteed Net Green!", flush=True)
+                send_telegram_msg(f"🛡️ <b>BREAKEVEN STOP LOSS ACTIVATED</b>\n\n• Asset: <b>#{sym}</b> ({side})\n• Mark Price: <b>${mark_p:,.4f}</b> (TP1 Reached 🎯)\n• New Stop Loss: <b>${be_str}</b> (Breakeven Locked 🔒)\n\n<i>This trade is now 100% risk-free!</i>")
     except Exception as e:
         pass
 

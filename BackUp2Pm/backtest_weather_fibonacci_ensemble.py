@@ -149,7 +149,7 @@ class WeatherFibonacciEnsembleBacktest:
                     self.monthly_pnl[month_key] -= funding_cost
                     pos['funding_paid'] = pos.get('funding_paid', 0.0) + funding_cost
 
-            # 1. Manage Active Positions (Option B: 50% TP1 + Breakeven + Dynamic TP2 Trailing Stop)
+            # 1. Manage Active Positions (TP1, TP2, TP3, SL, Breakeven)
             closed_syms = []
             for sym, pos in list(self.active_positions.items()):
                 bar_h = np_data[sym]['high'][bar_idx]
@@ -159,7 +159,7 @@ class WeatherFibonacciEnsembleBacktest:
                 is_long = side in ['BUY', 'LONG']
                 is_short = side in ['SELL', 'SHORT']
                 
-                # Check Stop Loss (Initial SL or Trailing Stop)
+                # Check Stop Loss first (worst-case execution)
                 hit_sl = False
                 sl_exit_price = pos['sl']
                 if is_long and bar_l <= pos['sl']:
@@ -188,22 +188,17 @@ class WeatherFibonacciEnsembleBacktest:
                     
                     pos['realized_pnl'] += net_pnl
                     pos['exit_time'] = current_time
-                    if pos['trailing_active']:
-                        pos['exit_reason'] = 'TP2_TRAILED_WIN'
-                    elif pos['tp1_hit']:
-                        pos['exit_reason'] = 'SL_BE'
-                    else:
-                        pos['exit_reason'] = 'STOP_LOSS'
+                    pos['exit_reason'] = 'SL_BE' if pos['tp1_hit'] else 'STOP_LOSS'
                     self.trade_history.append(pos)
                     closed_syms.append(sym)
                     continue
 
-                # Check TP1 (0.000 Retest - 50% Scale Out + Move SL to Breakeven + Activate Trailing Stop)
+                # Check TP1 (0.000 Retest - 40% Scale Out + Move SL to Breakeven)
                 if not pos['tp1_hit']:
                     tp1_hit = (is_long and bar_h >= pos['tp1']) or (is_short and bar_l <= pos['tp1'])
                     if tp1_hit:
                         pos['tp1_hit'] = True
-                        close_qty = pos['initial_qty'] * 0.50
+                        close_qty = pos['initial_qty'] * 0.40
                         pos['rem_qty'] -= close_qty
                         
                         tp_p = pos['tp1']
@@ -218,30 +213,54 @@ class WeatherFibonacciEnsembleBacktest:
                         self.monthly_pnl[month_key] += net_pnl
                         pos['realized_pnl'] += net_pnl
                         
-                        # Move stop to Breakeven (+0.05% fee buffer) & activate dynamic trailing stop
-                        be_price = pos['entry_price'] * 1.0005 if is_long else pos['entry_price'] * 0.9995
-                        pos['sl'] = be_price
-                        pos['trailing_active'] = True
-                        pos['highest_mark'] = bar_h
-                        pos['lowest_mark'] = bar_l
+                        # Move stop to breakeven
+                        pos['sl'] = pos['entry_price']
 
-                # Dynamic TP2 Trailing Stop Management on the Remaining 50% Runner
-                if pos['trailing_active']:
-                    atr_val = pos.get('atr', pos['entry_price'] * 0.008)
-                    trail_dist = 1.2 * atr_val
-                    
-                    if is_long:
-                        if bar_h > pos['highest_mark']:
-                            pos['highest_mark'] = bar_h
-                        calc_trail = pos['highest_mark'] - trail_dist
-                        if calc_trail > pos['sl'] and calc_trail > pos['entry_price']:
-                            pos['sl'] = calc_trail
-                    elif is_short:
-                        if bar_l < pos['lowest_mark']:
-                            pos['lowest_mark'] = bar_l
-                        calc_trail = pos['lowest_mark'] + trail_dist
-                        if calc_trail < pos['sl'] and calc_trail < pos['entry_price']:
-                            pos['sl'] = calc_trail
+                # Check TP2 (-0.618 Extension - 40% Scale Out)
+                if pos['tp1_hit'] and not pos['tp2_hit']:
+                    tp2_hit = (is_long and bar_h >= pos['tp2']) or (is_short and bar_l <= pos['tp2'])
+                    if tp2_hit:
+                        pos['tp2_hit'] = True
+                        close_qty = pos['initial_qty'] * 0.40
+                        pos['rem_qty'] -= close_qty
+                        
+                        tp_p = pos['tp2']
+                        raw_pnl = close_qty * (tp_p - pos['entry_price']) if is_long else close_qty * (pos['entry_price'] - tp_p)
+                        maker_fee = close_qty * tp_p * self.maker_fee
+                        
+                        self.total_maker_fees += maker_fee
+                        self.gross_profit_raw += raw_pnl
+                        
+                        net_pnl = raw_pnl - maker_fee
+                        self.balance += net_pnl
+                        self.monthly_pnl[month_key] += net_pnl
+                        pos['realized_pnl'] += net_pnl
+                        
+                        # Trail stop to TP1 level for remaining 20% runner
+                        pos['sl'] = pos['tp1']
+
+                # Check TP3 (-1.618 Runner - Remaining 20%)
+                if pos['tp2_hit']:
+                    tp3_hit = (is_long and bar_h >= pos['tp3']) or (is_short and bar_l <= pos['tp3'])
+                    if tp3_hit:
+                        close_qty = pos['rem_qty']
+                        tp_p = pos['tp3']
+                        raw_pnl = close_qty * (tp_p - pos['entry_price']) if is_long else close_qty * (pos['entry_price'] - tp_p)
+                        maker_fee = close_qty * tp_p * self.maker_fee
+                        
+                        self.total_maker_fees += maker_fee
+                        self.gross_profit_raw += raw_pnl
+                        
+                        net_pnl = raw_pnl - maker_fee
+                        self.balance += net_pnl
+                        self.monthly_pnl[month_key] += net_pnl
+                        pos['realized_pnl'] += net_pnl
+                        
+                        pos['exit_time'] = current_time
+                        pos['exit_reason'] = 'FULL_TP3_RUNNER'
+                        self.trade_history.append(pos)
+                        closed_syms.append(sym)
+                        continue
 
             for sym in closed_syms:
                 if sym in self.active_positions:
@@ -325,10 +344,6 @@ class WeatherFibonacciEnsembleBacktest:
                                 'tp3': tp3_p,
                                 'tp1_hit': False,
                                 'tp2_hit': False,
-                                'trailing_active': False,
-                                'atr': entry_p * 0.008,
-                                'highest_mark': entry_p,
-                                'lowest_mark': entry_p,
                                 'realized_pnl': -entry_fee,
                                 'channel': 'WEATHER_FIBONACCI_CONFLUENCE',
                                 'consensus': bull_models if side == 'BUY' else bear_models,
@@ -375,11 +390,12 @@ class WeatherFibonacciEnsembleBacktest:
 
         hard_sls = len([t for t in self.trade_history if t['exit_reason'] == 'STOP_LOSS'])
         be_sls = len([t for t in self.trade_history if t['exit_reason'] == 'SL_BE'])
-        trailed_wins = len([t for t in self.trade_history if t.get('exit_reason') == 'TP2_TRAILED_WIN'])
+        tp2_hits = len([t for t in self.trade_history if t['tp2_hit'] and t['exit_reason'] != 'FULL_TP3_RUNNER'])
+        tp3_hits = len([t for t in self.trade_history if t.get('exit_reason') == 'FULL_TP3_RUNNER'])
         total_all_friction = self.total_maker_fees + self.total_taker_fees + self.total_funding_fees + self.total_slippage_cost
 
         print("\n" + "="*75)
-        print("⚡ OPTION B: 50% TP1 SCALE-OUT + DYNAMIC TP2 TRAILING STOP BACKTEST")
+        print("⚡ WEATHER-ENSEMBLE + FIBONACCI: EXHAUSTIVE FEE & FRICTION AUDIT")
         print("="*75)
         print(f"Fee Schedule Tier:      {self.fee_tier.upper()}")
         print(f"Initial Balance:        ${self.initial_balance:,.2f} USDT")
@@ -392,16 +408,17 @@ class WeatherFibonacciEnsembleBacktest:
         print("💰 EXHAUSTIVE FEE & FRICTION ACCOUNTING BREAKDOWN:")
         print(f" • Gross Profit (Raw Market PnL):    ${self.gross_profit_raw:,.2f} USDT")
         print(f" • Gross Losses (Raw Market PnL):    ${self.gross_loss_raw:,.2f} USDT")
-        print(f" • Total Maker Fees Paid:            ${self.total_maker_fees:,.2f} USDT ({self.maker_fee*100:.3f}% on Entry & TP1 limits)")
-        print(f" • Total Taker Fees Paid:            ${self.total_taker_fees:,.2f} USDT ({self.taker_fee*100:.3f}% on SL & Trailing Stops)")
+        print(f" • Total Maker Fees Paid:            ${self.total_maker_fees:,.2f} USDT ({self.maker_fee*100:.3f}% on Entry & TP limits)")
+        print(f" • Total Taker Fees Paid:            ${self.total_taker_fees:,.2f} USDT ({self.taker_fee*100:.3f}% on SL & Close)")
         print(f" • Total 8-Hour Funding Fees Paid:   ${self.total_funding_fees:,.2f} USDT (0.010%/8h on open positions)")
         print(f" • Total Slippage Friction:          ${self.total_slippage_cost:,.2f} USDT ({self.slippage*100:.3f}% per market order)")
         print(f" • COMBINED TOTAL FRICTION DEDUCTED: ${total_all_friction:,.2f} USDT")
         print("-" * 75)
-        print("📊 OPTION B TRADE OUTCOME BREAKDOWN:")
+        print("📊 TRADE OUTCOME BREAKDOWN:")
         print(f" • Hard Stop Loss (Full -1R):        {hard_sls} ({hard_sls/total_trades*100:.1f}%)")
-        print(f" • TP1 Scaled -> SL Breakeven Exit:  {be_sls} ({be_sls/total_trades*100:.1f}%) -> Net Green (+1.06R)")
-        print(f" • TP2 Dynamic Trailed Big Wins:     {trailed_wins} ({trailed_wins/total_trades*100:.1f}%) -> Massive Expansion Wins (+2.8R - +6.5R)")
+        print(f" • TP1 Hit -> SL Breakeven Exit:     {be_sls} ({be_sls/total_trades*100:.1f}%) -> Net Green (+1.06R)")
+        print(f" • TP2 Hit (-0.618 Extension):       {tp2_hits} ({tp2_hits/total_trades*100:.1f}%) -> Big Win (+2.60R)")
+        print(f" • TP3 Full Runner (-1.618 Ext):     {tp3_hits} ({tp3_hits/total_trades*100:.1f}%) -> Massive Trend Win (+4.53R)")
         print("-" * 75)
         print("📅 MONTHLY PnL BREAKDOWN (AFTER ALL FEES & FUNDING):")
         for m, pnl in sorted(self.monthly_pnl.items()):
