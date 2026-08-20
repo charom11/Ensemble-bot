@@ -58,7 +58,7 @@ BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET', '')
 
 OPTIMIZED_SYMBOLS = [
     # 🪙 High-Beta Momentum Leaders & Heavyweights (Top Institutional Priority)
-    "SOLUSDT", "BTCUSDT", "ETHUSDT", "SUIUSDT", "NEARUSDT", "AVAXUSDT", "LINKUSDT", "XAUUSDT",
+    "SOLUSDT", "BTCUSDT", "ETHUSDT", "SUIUSDT", "NEARUSDT", "AVAXUSDT", "LINKUSDT", "PAXGUSDT",
     # ⚡ High-Volume Large-Cap Assets
     "XRPUSDT", "DOGEUSDT", "ADAUSDT", "BNBUSDT", "APTUSDT", "RENDERUSDT"
 ]
@@ -80,6 +80,15 @@ class CircuitBreakerManager:
         self.consecutive_losses = 0
         self.circuit_tripped = False
         self.trip_reason = ""
+        self.asset_cooldowns = {} # symbol -> cooldown_until_timestamp
+
+    def is_asset_in_cooldown(self, symbol):
+        until = self.asset_cooldowns.get(symbol, 0)
+        return time.time() < until
+
+    def trigger_asset_cooldown(self, symbol, duration_seconds=5400):
+        self.asset_cooldowns[symbol] = time.time() + duration_seconds
+        print(f"[ASSET COOLDOWN] #{symbol} paused for {duration_seconds/60:.0f} mins to prevent knife-catching.")
 
     def check_and_update(self, current_balance):
         now = time.time()
@@ -223,6 +232,144 @@ def get_mtf_heatmap_data():
     return results
 
 # --------------------------------------------------------------------------
+# 📐 Objective Fibonacci Retracement & Extension Engine (Golden Pocket 0.50-0.618)
+# --------------------------------------------------------------------------
+def detect_fractal_swings_series(highs, lows, window=4):
+    """
+    Identifies Fractal Swings with zero look-ahead bias:
+    A swing at index i is confirmed only after `window` subsequent bars.
+    Returns: (swing_highs, swing_lows) as lists of (confirmed_idx, price)
+    """
+    n = len(highs)
+    swing_highs = []
+    swing_lows = []
+    for i in range(window, n - window):
+        if all(highs[i] >= highs[i - k] for k in range(1, window + 1)) and \
+           all(highs[i] >= highs[i + k] for k in range(1, window + 1)):
+            swing_highs.append((i + window, highs[i]))
+        if all(lows[i] <= lows[i - k] for k in range(1, window + 1)) and \
+           all(lows[i] <= lows[i + k] for k in range(1, window + 1)):
+            swing_lows.append((i + window, lows[i]))
+    return swing_highs, swing_lows
+
+def check_fibonacci_setup(df, symbol="XRPUSDT"):
+    """
+    📐 Institutional Fibonacci Retracement & Extension Engine:
+    1. Extracts confirmed Fractal Swings (Anchor High/Low).
+    2. Measures impulse range R = S_H - S_L.
+    3. Calculates Golden Pocket (0.500 - 0.618), Invalidation SL (0.786 + 0.5x ATR),
+       and Multi-Tier Take-Profit Extensions (0.000 Retest, -0.618 Extension, -1.618 Runner).
+    """
+    try:
+        if df is None or len(df) < 35:
+            return {'state': 'NO_DATA', 'is_setup': False}
+
+        highs = df['high'].values
+        lows = df['low'].values
+        closes = df['close'].values
+        curr_p = closes[-1]
+        curr_h = highs[-1]
+        curr_l = lows[-1]
+
+        # Calculate ATR(14)
+        tr = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - df['close'].shift(1)).abs(),
+            (df['low'] - df['close'].shift(1)).abs()
+        ], axis=1).max(axis=1)
+        atr_val = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else (curr_p * 0.005)
+
+        sh_list, sl_list = detect_fractal_swings_series(highs, lows, window=4)
+        if not sh_list or not sl_list:
+            return {'state': 'NO_SWINGS', 'is_setup': False}
+
+        last_sh = sh_list[-1]  # (confirmed_idx, price)
+        last_sl = sl_list[-1]  # (confirmed_idx, price)
+
+        s_high = last_sh[1]
+        s_low = last_sl[1]
+        impulse = s_high - s_low
+
+        if impulse < (1.5 * atr_val):
+            return {'state': 'IMPULSE_TOO_SMALL', 'is_setup': False}
+
+        # Trend context from EMA50 & EMA200
+        ema50 = pd.Series(closes).ewm(span=50, adjust=False).mean().iloc[-1]
+        ema200 = pd.Series(closes).ewm(span=200, adjust=False).mean().iloc[-1] if len(closes) >= 200 else ema50
+        is_uptrend = (curr_p > ema200) and (ema50 >= ema200)
+        is_downtrend = (curr_p < ema200) and (ema50 <= ema200)
+
+        # 1. Bullish Retracement into Golden Pocket
+        if is_uptrend and last_sh[0] > last_sl[0]:
+            fib_050 = s_high - (0.500 * impulse)
+            fib_0618 = s_high - (0.618 * impulse)
+            fib_0786 = s_high - (0.786 * impulse)
+
+            if (curr_l <= fib_050) and (curr_p >= fib_0618):
+                entry_p = fib_0618
+                sl_p = fib_0786 - (0.50 * atr_val)
+                tp1_p = s_high
+                tp2_p = s_high + (0.618 * impulse)
+                tp3_p = s_high + (1.618 * impulse)
+                
+                risk = entry_p - sl_p
+                reward = tp1_p - entry_p
+                rr = reward / (risk + 1e-9)
+                
+                return {
+                    'state': 'GOLDEN_POCKET_BUY',
+                    'is_setup': True,
+                    'side': 'BUY',
+                    'entry_price': entry_p,
+                    'sl': sl_p,
+                    'tp1': tp1_p,
+                    'tp2': tp2_p,
+                    'tp3': tp3_p,
+                    'rr': rr,
+                    's_high': s_high,
+                    's_low': s_low,
+                    'impulse': impulse,
+                    'desc': f"📐 Golden Pocket 0.618 Long (${entry_p:.4f}) | TP1: ${tp1_p:.4f} | TP2: ${tp2_p:.4f} | SL: ${sl_p:.4f}"
+                }
+
+        # 2. Bearish Retracement into Golden Pocket
+        elif is_downtrend and last_sl[0] > last_sh[0]:
+            fib_050 = s_low + (0.500 * impulse)
+            fib_0618 = s_low + (0.618 * impulse)
+            fib_0786 = s_low + (0.786 * impulse)
+
+            if (curr_h >= fib_050) and (curr_p <= fib_0618):
+                entry_p = fib_0618
+                sl_p = fib_0786 + (0.50 * atr_val)
+                tp1_p = s_low
+                tp2_p = s_low - (0.618 * impulse)
+                tp3_p = s_low - (1.618 * impulse)
+
+                risk = sl_p - entry_p
+                reward = entry_p - tp1_p
+                rr = reward / (risk + 1e-9)
+
+                return {
+                    'state': 'GOLDEN_POCKET_SELL',
+                    'is_setup': True,
+                    'side': 'SELL',
+                    'entry_price': entry_p,
+                    'sl': sl_p,
+                    'tp1': tp1_p,
+                    'tp2': tp2_p,
+                    'tp3': tp3_p,
+                    'rr': rr,
+                    's_high': s_high,
+                    's_low': s_low,
+                    'impulse': impulse,
+                    'desc': f"📐 Golden Pocket 0.618 Short (${entry_p:.4f}) | TP1: ${tp1_p:.4f} | TP2: ${tp2_p:.4f} | SL: ${sl_p:.4f}"
+                }
+
+        return {'state': 'IN_RANGE', 'is_setup': False}
+    except Exception as e:
+        return {'state': 'ERROR', 'error': str(e), 'is_setup': False}
+
+# --------------------------------------------------------------------------
 # 🥔 "Potato" Support & Resistance Engine (Pure Price Action Levels)
 # --------------------------------------------------------------------------
 def check_potato_sr_levels(symbol="XRPUSDT"):
@@ -354,13 +501,14 @@ def get_divergence_status(symbol="XRPUSDT"):
 # --------------------------------------------------------------------------
 def check_btc_macro_health(target_side):
     """
-    👑 BTC Master Beta Trend Filter:
+    👑 BTC Master Beta Trend Filter (15m Execution Timeframe):
     - Protects against cross-asset correlation crashes.
-    - NEVER opens an Altcoin LONG if BTC 5m is dumping below its EMA20.
-    - NEVER opens an Altcoin SHORT if BTC is in a vertical parabolic pump.
+    - Uses 15m candles to match bot execution timeframe (reduces 5m noise).
+    - NEVER opens an Altcoin LONG if BTC 15m is dumping below its EMA20 with > 0.50% flush.
+    - NEVER opens an Altcoin SHORT if BTC is in a vertical parabolic pump > 0.60%.
     """
     try:
-        url = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=30"
+        url = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=30"
         r = requests.get(url, timeout=3)
         if r.status_code != 200:
             return True, "BTC Normal"
@@ -368,14 +516,14 @@ def check_btc_macro_health(target_side):
         closes = [float(k[4]) for k in raw]
         curr_btc = closes[-1]
         ema20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
-        ret_5m = (curr_btc - closes[-2]) / closes[-2]
+        ret_15m = (curr_btc - closes[-2]) / closes[-2]
         
         if target_side.upper() in ['BUY', 'LONG']:
-            if curr_btc < ema20 and ret_5m < -0.0020:
-                return False, f"BTC Flushing ({ret_5m*100:+.2f}% in 5m) - Altcoin Long Blocked 🛑"
+            if curr_btc < ema20 and ret_15m < -0.0050:
+                return False, f"BTC Flushing ({ret_15m*100:+.2f}% in 15m) - Altcoin Long Blocked 🛑"
         elif target_side.upper() in ['SELL', 'SHORT']:
-            if curr_btc > ema20 and ret_5m > +0.0030:
-                return False, f"BTC Pumping ({ret_5m*100:+.2f}% in 5m) - Altcoin Short Blocked 🛑"
+            if curr_btc > ema20 and ret_15m > +0.0060:
+                return False, f"BTC Pumping ({ret_15m*100:+.2f}% in 15m) - Altcoin Short Blocked 🛑"
         return True, "BTC Aligned ✅"
     except Exception:
         return True, "BTC Normal"
@@ -404,7 +552,44 @@ def check_portfolio_risk_capacity(balance, new_margin_usdt, max_portfolio_margin
 # --------------------------------------------------------------------------
 # Binance Futures Authenticated API Helper (`fapi.binance.com`)
 # --------------------------------------------------------------------------
+# Cached server time offset and exchange info to avoid redundant HTTP calls
+_SERVER_TIME_OFFSET = 0  # ms offset between local clock and Binance server
+_SERVER_TIME_SYNCED = False
+
+_EXCHANGE_INFO_CACHE = {}  # symbol -> {'pricePrecision': int, 'quantityPrecision': int}
+_EXCHANGE_INFO_TS = 0
+
+def sync_server_time():
+    global _SERVER_TIME_OFFSET, _SERVER_TIME_SYNCED
+    try:
+        t_res = requests.get('https://fapi.binance.com/fapi/v1/time', timeout=3)
+        if t_res.status_code == 200:
+            server_ts = t_res.json()['serverTime']
+            local_ts = int(time.time() * 1000)
+            _SERVER_TIME_OFFSET = server_ts - local_ts
+            _SERVER_TIME_SYNCED = True
+    except Exception:
+        _SERVER_TIME_OFFSET = 0
+
+def get_symbol_precision(symbol):
+    global _EXCHANGE_INFO_CACHE, _EXCHANGE_INFO_TS
+    now = time.time()
+    if now - _EXCHANGE_INFO_TS > 3600 or not _EXCHANGE_INFO_CACHE:
+        try:
+            ex_info = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=8).json()
+            for s in ex_info.get('symbols', []):
+                _EXCHANGE_INFO_CACHE[s['symbol']] = {
+                    'pricePrecision': s.get('pricePrecision', 4),
+                    'quantityPrecision': s.get('quantityPrecision', 3)
+                }
+            _EXCHANGE_INFO_TS = now
+        except Exception:
+            pass
+    info = _EXCHANGE_INFO_CACHE.get(symbol, {'pricePrecision': 4, 'quantityPrecision': 3})
+    return info['pricePrecision'], info['quantityPrecision']
+
 def binance_futures_signed_request(method, endpoint, params=None):
+    global _SERVER_TIME_SYNCED
     api_key = os.getenv('BINANCE_API_KEY', BINANCE_API_KEY)
     api_secret = os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET)
     if not api_key or not api_secret:
@@ -413,11 +598,10 @@ def binance_futures_signed_request(method, endpoint, params=None):
     if params is None:
         params = {}
 
-    try:
-        t_res = requests.get('https://fapi.binance.com/fapi/v1/time', timeout=3)
-        timestamp = t_res.json()['serverTime'] if t_res.status_code == 200 else int(time.time() * 1000)
-    except Exception:
-        timestamp = int(time.time() * 1000)
+    # Use cached server time offset instead of fetching /fapi/v1/time every call
+    if not _SERVER_TIME_SYNCED:
+        sync_server_time()
+    timestamp = int(time.time() * 1000) + _SERVER_TIME_OFFSET
 
     params['recvWindow'] = 10000
     params['timestamp'] = timestamp
@@ -443,9 +627,15 @@ def binance_futures_signed_request(method, endpoint, params=None):
             return None
 
         try:
-            return r.json()
+            result = r.json()
         except Exception:
             return {'error': r.status_code, 'text': r.text}
+
+        # Re-sync if timestamp error detected
+        if isinstance(result, dict) and result.get('code') == -1021:
+            sync_server_time()
+
+        return result
     except Exception as e:
         return {'error': str(e)}
 
@@ -727,17 +917,7 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
     close_side = 'SELL' if side.upper() in ['BUY', 'LONG'] else 'BUY'
     position_side = 'LONG' if side.upper() in ['BUY', 'LONG'] else 'SHORT'
 
-    price_prec = 4
-    qty_prec = 3
-    try:
-        ex_info = requests.get(f"https://fapi.binance.com/fapi/v1/exchangeInfo?symbol={symbol}", timeout=5).json()
-        for s in ex_info.get('symbols', []):
-            if s['symbol'] == symbol:
-                price_prec = s.get('pricePrecision', 4)
-                qty_prec = s.get('quantityPrecision', 3)
-                break
-    except Exception:
-        pass
+    price_prec, qty_prec = get_symbol_precision(symbol)
 
     tp1_str = f"{tp1_price:.{price_prec}f}"
     sl_str = f"{sl_price:.{price_prec}f}"
@@ -750,22 +930,8 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
             half_qty = int(half_qty)
         half_qty_str = str(half_qty)
 
-    # 1. Partial TP1 Limit Order (Maker Fee 0.020% at Target Level)
-    tp_params = {
-        'symbol': symbol,
-        'side': close_side,
-        'type': 'LIMIT',
-        'price': tp1_str,
-        'positionSide': position_side,
-        'timeInForce': 'GTC'
-    }
-    if half_qty_str:
-        tp_params['quantity'] = half_qty_str
-    else:
-        tp_params['quantity'] = str(total_qty)
-    tp_res = binance_futures_signed_request('POST', '/fapi/v1/order', tp_params)
-
-    # 2. Stop Loss Order (Full Protective Stop via Algo / CCXT Endpoint)
+    # 1. Take Profit Order (Native TAKE_PROFIT_MARKET on Binance Conditional Orders)
+    tp_res = None
     sl_res = None
     try:
         import ccxt
@@ -776,6 +942,18 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
         })
         exchange.load_time_difference()
         ccxt_sym = symbol.replace('USDT', '/USDT:USDT')
+        
+        # Place Take Profit
+        tp_order = exchange.create_order(
+            symbol=ccxt_sym,
+            type='TAKE_PROFIT_MARKET',
+            side=close_side.lower(),
+            amount=float(total_qty),
+            params={'stopPrice': float(tp1_str), 'positionSide': position_side}
+        )
+        tp_res = {'status': 'success', 'id': tp_order.get('id'), 'price': tp1_str}
+        
+        # Place Stop Loss
         sl_order = exchange.create_order(
             symbol=ccxt_sym,
             type='STOP_MARKET',
@@ -783,11 +961,30 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
             amount=float(total_qty),
             params={'stopPrice': float(sl_str), 'positionSide': position_side}
         )
-        sl_res = {'status': 'success', 'id': sl_order.get('id')}
+        sl_res = {'status': 'success', 'id': sl_order.get('id'), 'price': sl_str}
     except Exception as e:
-        sl_res = {'error': str(e)}
+        # Fallback to direct signed API if CCXT has issues
+        tp_params = {
+            'symbol': symbol,
+            'side': close_side,
+            'type': 'TAKE_PROFIT_MARKET',
+            'stopPrice': tp1_str,
+            'closePosition': 'true',
+            'positionSide': position_side
+        }
+        tp_res = binance_futures_signed_request('POST', '/fapi/v1/order', tp_params)
+        
+        sl_params = {
+            'symbol': symbol,
+            'side': close_side,
+            'type': 'STOP_MARKET',
+            'stopPrice': sl_str,
+            'closePosition': 'true',
+            'positionSide': position_side
+        }
+        sl_res = binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
 
-    print(f"[ORDERS PLACED] {symbol} {side} | TP Target (Limit @ Maker): ${tp1_str} | SL (Algo Stop Market): ${sl_str}")
+    print(f"[ORDERS PLACED] {symbol} {side} | TP Target (Take Profit Market): ${tp1_str} | SL (Stop Market): ${sl_str}", flush=True)
     return {'tp_price': tp1_str, 'sl_price': sl_str, 'act_price': act_str, 'tp_res': tp_res, 'sl_res': sl_res}
 
 def place_binance_futures_market_order(symbol="XRPUSDT", side="BUY", trade_usdt=None, margin_pct=0.03, sizing_mode="margin", last_price=None, leverage=50, atr=None, custom_tp=None, custom_sl=None):
@@ -844,19 +1041,18 @@ def place_binance_futures_market_order(symbol="XRPUSDT", side="BUY", trade_usdt=
         return {'error': 'Insufficient USDT balance', 'avail': avail_balance, 'required_margin': margin_usdt}
 
     raw_qty = notional_usdt / last_price
-    qty_prec = 3
-    try:
-        ex_info = requests.get(f"https://fapi.binance.com/fapi/v1/exchangeInfo?symbol={symbol}", timeout=5).json()
-        for s in ex_info.get('symbols', []):
-            if s['symbol'] == symbol:
-                qty_prec = s.get('quantityPrecision', 3)
-                break
-    except Exception:
-        pass
+    _, qty_prec = get_symbol_precision(symbol)
 
     qty = round(raw_qty, qty_prec)
     if qty_prec == 0:
         qty = int(qty)
+
+    # Ensure rounded quantity strictly satisfies Binance $5.00 min notional
+    if (qty * last_price) < 5.05:
+        step = 1 if qty_prec == 0 else round(10 ** (-qty_prec), qty_prec)
+        qty = round(qty + step, qty_prec)
+        if qty_prec == 0:
+            qty = int(qty)
 
     position_side = 'BOTH'
     pos_mode_res = binance_futures_signed_request('GET', '/fapi/v1/positionSide/dual')
@@ -870,8 +1066,12 @@ def place_binance_futures_market_order(symbol="XRPUSDT", side="BUY", trade_usdt=
         'quantity': str(qty),
         'positionSide': position_side
     }
-    print(f"[BINANCE LIVE ORDER] {symbol} {side} | Margin: ${margin_usdt:.2f} | Notional: ${notional_usdt:.2f} ({leverage}x) | Qty: {qty}")
     res = binance_futures_signed_request('POST', '/fapi/v1/order', params)
+
+    if isinstance(res, dict) and 'code' in res and 'orderId' not in res:
+        print(f"[BINANCE REJECTED ORDER] {symbol} {side} Error: {res.get('msg')} (code: {res.get('code')})", flush=True)
+    elif isinstance(res, dict) and 'orderId' in res:
+        print(f"[BINANCE ORDER FILLED] #{symbol} {side} Order ID: #{res.get('orderId')} | Status: {res.get('status', 'FILLED')}", flush=True)
 
     if isinstance(res, dict) and 'orderId' in res and (atr is not None or custom_tp is not None or custom_sl is not None):
         tp_sl_info = place_binance_futures_tp_sl(
@@ -1010,7 +1210,7 @@ QUANT_PILLAR_WEIGHTS = {
 }
 
 class WeatherEnsembleBot:
-    def __init__(self, consensus_threshold=30, live_trading=False, trade_usdt=None, margin_pct=0.03, sizing_mode="margin", leverage=50, timeframe="15m"):
+    def __init__(self, consensus_threshold=30, live_trading=False, trade_usdt=None, margin_pct=0.03, sizing_mode="margin", leverage=50, timeframe="15m", max_positions=5):
         self.threshold = consensus_threshold
         self.timeframe = timeframe # '1m', '3m', '5m', '15m', '1h', '4h'
         self.total_models = len(MODEL_NAMES)
@@ -1019,7 +1219,7 @@ class WeatherEnsembleBot:
         self.margin_pct = margin_pct
         self.sizing_mode = sizing_mode
         self.leverage = leverage
-        self.max_active_positions = 1  # Single position focus for small accounts
+        self.max_active_positions = max_positions  # 5 concurrent positions
         self.paused = False
         self.ledger = []
         self.last_notified_bars = {}
@@ -1067,14 +1267,29 @@ class WeatherEnsembleBot:
         rsi_series = cls.calc_rsi(pd.Series(closes), 14).values
         cci_series = cls.calc_cci(df, 20).values
 
-        # Bullish Divergence Detection
+        # Find the bar index of the prior swing low/high within the lookback window
+        lookback = min(15, len(closes) - 1)
+
+        # Bullish Divergence: Price makes Lower Low but RSI makes Higher Low
         bull_div = False
-        if closes[-1] <= min(closes[-15:-1]) and rsi_series[-1] > min(rsi_series[-15:-1]) and cci_series[-1] > -120:
+        prior_low_idx = np.argmin(closes[-lookback:-1])  # index relative to lookback window
+        prior_low_price = closes[-lookback + prior_low_idx]
+        prior_low_rsi = rsi_series[-lookback + prior_low_idx]
+        if (closes[-1] <= prior_low_price and
+            rsi_series[-1] > prior_low_rsi + 5.0 and   # Require ≥ 5 RSI points higher
+            cci_series[-1] > -120 and
+            not np.isnan(rsi_series[-1]) and not np.isnan(prior_low_rsi)):
             bull_div = True
 
-        # Bearish Divergence Detection
+        # Bearish Divergence: Price makes Higher High but RSI makes Lower High
         bear_div = False
-        if closes[-1] >= max(closes[-15:-1]) and rsi_series[-1] < max(rsi_series[-15:-1]) and cci_series[-1] < 120:
+        prior_high_idx = np.argmax(closes[-lookback:-1])
+        prior_high_price = closes[-lookback + prior_high_idx]
+        prior_high_rsi = rsi_series[-lookback + prior_high_idx]
+        if (closes[-1] >= prior_high_price and
+            rsi_series[-1] < prior_high_rsi - 5.0 and  # Require ≥ 5 RSI points lower
+            cci_series[-1] < 120 and
+            not np.isnan(rsi_series[-1]) and not np.isnan(prior_high_rsi)):
             bear_div = True
 
         if bull_div and not bear_div:
@@ -1250,7 +1465,44 @@ class WeatherEnsembleBot:
         bear_weight = sum(w for s, w in zip(signals, weights) if s == 'BEARISH')
         return max(bull_weight, bear_weight)
 
+    def compute_pillar_consensus(self, signals):
+        """
+        Groups the 31 models into their 9 original quant pillars, takes majority
+        vote per pillar, and returns pillar-level consensus. This prevents
+        correlated models from inflating raw count consensus.
+        
+        Returns: (pillar_bull, pillar_bear, pillar_total=9)
+        """
+        # Pillar boundaries: [start_idx, end_idx_exclusive]
+        pillars = [
+            ('momentum', 0, 4),          # Q01-Q04
+            ('mean_reversion', 4, 8),      # Q05-Q08
+            ('pairs_trading', 8, 11),      # Q09-Q11
+            ('volatility', 11, 14),        # Q12-Q14
+            ('event_driven', 14, 17),      # Q15-Q17
+            ('machine_learning', 17, 21),  # Q18-Q21
+            ('time_series', 21, 24),       # Q22-Q24
+            ('factor_based', 24, 28),      # Q25-Q28
+            ('seasonality', 28, 31)        # Q29-Q31
+        ]
+        pillar_bull = 0
+        pillar_bear = 0
+        for name, start, end in pillars:
+            group = signals[start:end]
+            b = group.count('BULLISH')
+            s = group.count('BEARISH')
+            if b > s:
+                pillar_bull += 1
+            elif s > b:
+                pillar_bear += 1
+            # Tie or all neutral = no pillar vote
+        return pillar_bull, pillar_bear, 9
+
     def evaluate_bar(self, df, symbol="XRPUSDT", active_count=0):
+        if df is None or len(df) < 5:
+            return {'symbol': symbol, 'action': 'NO TRADE', 'is_trade': False}
+
+        last_price = float(df['close'].iloc[-1])
         signals = self.evaluate_31_models(df)
         bull_count = signals.count('BULLISH')
         bear_count = signals.count('BEARISH')
@@ -1259,6 +1511,8 @@ class WeatherEnsembleBot:
         max_consensus = max(bull_count, bear_count)
         agreement_pct = (max_consensus / self.total_models) * 100
         weighted_score = self.compute_weighted_consensus(signals)
+        pillar_bull, pillar_bear, pillar_total = self.compute_pillar_consensus(signals)
+        pillar_consensus = max(pillar_bull, pillar_bear)
 
         action = 'NO TRADE'
         target_side = None
@@ -1273,6 +1527,9 @@ class WeatherEnsembleBot:
 
         # Check Dual RSI + CCI Divergence Confluence
         div_state, bull_div, bear_div = self.calc_rsi_cci_divergence(df)
+
+        # Check Objective Fibonacci Retracement & Extension Setup (Golden Pocket 0.50-0.618)
+        fib_info = check_fibonacci_setup(df, symbol)
 
         # Volume & ATR Volatility Expansion Confluence Checks
         vols = df['volume'].values
@@ -1289,29 +1546,66 @@ class WeatherEnsembleBot:
         is_atr_expanded = atr14_val >= (atr50_val * 1.05)
 
         if not self.paused and not CIRCUIT_BREAKER.circuit_tripped and active_count < self.max_active_positions:
-            # Channel 1: 31-Model Quant Consensus (≥ 30/31)
-            if max_consensus >= self.threshold:
-                target_side = 'BUY' if bull_count >= self.threshold else 'SELL'
+            # Channel 0: 📐 Objective Fibonacci Golden Pocket Trigger (0.500 - 0.618 Retracement)
+            if fib_info.get('is_setup') and fib_info.get('rr', 0) >= 1.8:
+                target_side = fib_info['side']
+                smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, target_side)
                 ob_ok, ob_ratio, _, _ = check_order_book_imbalance(symbol, target_side)
                 funding_ok, funding_rate = check_funding_rate(symbol, target_side)
-                smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, target_side)
-                of_ok, of_desc, of_delta_pct, of_abs = check_order_flow_absorption(symbol, target_side)
 
-                if ob_ok and funding_ok and smc_4h_ok and of_ok and is_vol_surge and is_atr_expanded:
+                if smc_4h_ok and ob_ok and funding_ok:
                     action = target_side
+                    trade_custom_tp = fib_info['tp1']
+                    trade_custom_sl = fib_info['sl']
+                    of_desc = fib_info['desc']
+                    print(f"[FIBONACCI GOLDEN POCKET AUTO-{target_side}] {symbol} 0.618 Entry @ ${fib_info['entry_price']:.4f} | TP1: ${fib_info['tp1']:.4f} | TP2: ${fib_info['tp2']:.4f} | SL: ${fib_info['sl']:.4f} (R:R {fib_info['rr']:.2f}) 📐", flush=True)
+
+            # Channel 1: 31-Model Quant Consensus (≥ 30/31) + Pillar Validation (≥ 7/9)
+            elif max_consensus >= self.threshold:
+                target_side = 'BUY' if bull_count >= self.threshold else 'SELL'
+                # Pillar-level independence gate: prevents correlated models from inflating consensus
+                pillar_ok = pillar_consensus >= 7
+                if not pillar_ok:
+                    print(f"[FILTERED PILLAR] {symbol} {target_side} raw consensus {max_consensus}/31 but only {pillar_consensus}/9 pillars agree (need ≥ 7/9).", flush=True)
                 else:
-                    if not is_vol_surge:
-                        print(f"[FILTERED VOLUME] {symbol} {target_side} consensus reached ({max_consensus}/31) but Volume is below expansion threshold ({vols[-1]:,.1f} < {vol_sma20*1.20:,.1f}).", flush=True)
-                    if not is_atr_expanded:
-                        print(f"[FILTERED VOLATILITY] {symbol} {target_side} consensus reached ({max_consensus}/31) but ATR is compressed ({atr14_val:.4f} < {atr50_val*1.05:.4f}).", flush=True)
-                    if not of_ok:
-                        print(f"[FILTERED ORDER FLOW] {symbol} {target_side} consensus reached ({max_consensus}/31) but Order Flow opposes ({of_desc}).", flush=True)
-                    if not smc_4h_ok:
-                        print(f"[FILTERED SMC 4H] {symbol} {target_side} consensus reached ({max_consensus}/31) but opposes 4H Macro Bias: {smc_bias_desc}.", flush=True)
-                    if not ob_ok:
-                        print(f"[FILTERED OB] {symbol} {target_side} consensus reached ({max_consensus}/31) but Order Book Imbalance failed ({ob_ratio}x < 1.05x).", flush=True)
-                    if not funding_ok:
-                        print(f"[FILTERED FUNDING] {symbol} {target_side} consensus reached ({max_consensus}/31) but Funding Rate is heavily adverse ({funding_rate*100:.3f}%).", flush=True)
+                    ob_ok, ob_ratio, _, _ = check_order_book_imbalance(symbol, target_side)
+                    funding_ok, funding_rate = check_funding_rate(symbol, target_side)
+                    smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, target_side)
+                    of_ok, of_desc, of_delta_pct, of_abs = check_order_flow_absorption(symbol, target_side)
+
+                    if ob_ok and funding_ok and smc_4h_ok and of_ok and is_vol_surge and is_atr_expanded:
+                        action = target_side
+                        # Populate structural TP/SL from Potato S&R so R:R gate is not bypassed
+                        p_sup = potato_info.get('support', 0)
+                        p_res = potato_info.get('resistance', 0)
+                        if p_sup > 0 and p_res > 0 and p_res > p_sup:
+                            if target_side == 'BUY':
+                                trade_custom_tp = p_res
+                                trade_custom_sl = max(p_sup * 0.995, last_price - (0.9 * atr14_val))
+                            else:
+                                trade_custom_tp = p_sup
+                                trade_custom_sl = min(p_res * 1.005, last_price + (0.9 * atr14_val))
+                        else:
+                            # Fallback: ATR-based targets when no valid S&R available
+                            if target_side == 'BUY':
+                                trade_custom_tp = last_price + (3.2 * atr14_val)
+                                trade_custom_sl = last_price - (0.9 * atr14_val)
+                            else:
+                                trade_custom_tp = last_price - (3.2 * atr14_val)
+                                trade_custom_sl = last_price + (0.9 * atr14_val)
+                    else:
+                        if not is_vol_surge:
+                            print(f"[FILTERED VOLUME] {symbol} {target_side} consensus reached ({max_consensus}/31) but Volume is below expansion threshold ({vols[-1]:,.1f} < {vol_sma20*1.20:,.1f}).", flush=True)
+                        if not is_atr_expanded:
+                            print(f"[FILTERED VOLATILITY] {symbol} {target_side} consensus reached ({max_consensus}/31) but ATR is compressed ({atr14_val:.4f} < {atr50_val*1.05:.4f}).", flush=True)
+                        if not of_ok:
+                            print(f"[FILTERED ORDER FLOW] {symbol} {target_side} consensus reached ({max_consensus}/31) but Order Flow opposes ({of_desc}).", flush=True)
+                        if not smc_4h_ok:
+                            print(f"[FILTERED SMC 4H] {symbol} {target_side} consensus reached ({max_consensus}/31) but opposes 4H Macro Bias: {smc_bias_desc}.", flush=True)
+                        if not ob_ok:
+                            print(f"[FILTERED OB] {symbol} {target_side} consensus reached ({max_consensus}/31) but Order Book Imbalance failed ({ob_ratio}x < 1.05x).", flush=True)
+                        if not funding_ok:
+                            print(f"[FILTERED FUNDING] {symbol} {target_side} consensus reached ({max_consensus}/31) but Funding Rate is heavily adverse ({funding_rate*100:.3f}%).", flush=True)
 
             # Channel 2: RSI + CCI Dual Divergence Sniper Trigger (High Conviction Lead + Confirm)
             elif bull_div:
@@ -1358,6 +1652,16 @@ class WeatherEnsembleBot:
                     print(f"[POTATO S&R {'TURTLE SOUP SWEEP' if is_sweep else 'AUTO-SELL'}] {symbol} @ Ceiling in 4H Downtrend | TP Target: ${trade_custom_tp:.4f} (Floor) 🔴", flush=True)
                 else:
                     print(f"[POTATO S&R SKIPPED] {symbol} tapped Ceiling @ ${potato_info.get('resistance', 0):.4f} but 4H Macro is Uptrend (Avoid Shorting Bull Trend) 🛑", flush=True)
+
+        # Minimum Structural 1.8 R:R Clearance Gate
+        if action != 'NO TRADE' and trade_custom_tp and trade_custom_sl:
+            calc_ref_price = fib_info.get('entry_price', last_price) if (fib_info.get('is_setup') and action == fib_info.get('side')) else last_price
+            risk_d = abs(calc_ref_price - trade_custom_sl)
+            reward_d = abs(trade_custom_tp - calc_ref_price)
+            rr_ratio = reward_d / (risk_d + 1e-9)
+            if rr_ratio < 1.8:
+                print(f"[FILTERED R:R RATIO] {symbol} {action} cancelled: Structural R:R {rr_ratio:.2f} < 1.8x minimum requirement.", flush=True)
+                action = 'NO TRADE'
 
         # 👑 BTC Master Beta Filter & 🔒 6% Portfolio Margin Cap Confirmation
         if action != 'NO TRADE' and symbol != 'BTCUSDT':
@@ -1672,8 +1976,15 @@ class WeatherEnsembleBot:
             if self.live_trading:
                 cleanup_orphaned_orders()
 
-            active_count = get_binance_futures_open_positions_count() if self.live_trading else 0
+            active_positions = get_binance_futures_positions() if self.live_trading else []
+            active_symbols = set(p['symbol'] for p in active_positions if abs(float(p.get('positionAmt', 0.0))) > 0.0)
+            active_count = len(active_symbols)
+
             for symbol in OPTIMIZED_SYMBOLS:
+                # 🛑 1 Position Per Symbol Maximum: Skip symbols that already have an active open position
+                if symbol in active_symbols:
+                    continue
+
                 df = self.fetch_binance_klines(symbol=symbol)
                 if df is not None and len(df) >= 35:
                     res = self.evaluate_bar(df, symbol=symbol, active_count=active_count)
@@ -1683,6 +1994,7 @@ class WeatherEnsembleBot:
                     t_str = res['timestamp']
                     
                     if action != 'NO TRADE':
+                        active_symbols.add(symbol)
                         active_count += 1
                         print(f"[SIGNAL TRIGGERED] [{t_str}] [{symbol}] ${price:,.4f} | Consensus: {consensus}/31 | ACTION: {action}", flush=True)
                     else:
@@ -1732,6 +2044,7 @@ if __name__ == '__main__':
     parser.add_argument('--leverage', type=int, default=50, help='Leverage multiplier (default 50x)')
     parser.add_argument('--threshold', type=int, default=30, help='Consensus threshold (default 30/31)')
     parser.add_argument('--timeframe', type=str, default='15m', help='Execution timeframe (default 15m)')
+    parser.add_argument('--max-positions', type=int, default=5, help='Max concurrent positions (default 5)')
     args = parser.parse_args()
 
     bot = WeatherEnsembleBot(
@@ -1741,7 +2054,8 @@ if __name__ == '__main__':
         margin_pct=args.margin_pct,
         sizing_mode=args.sizing_mode,
         leverage=args.leverage,
-        timeframe=args.timeframe
+        timeframe=args.timeframe,
+        max_positions=args.max_positions
     )
     try:
         bot.run_multi_asset_live_loop()

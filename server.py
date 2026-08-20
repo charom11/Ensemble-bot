@@ -276,6 +276,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         leverage = params.get('leverage', 50)
         threshold = params.get('threshold', 30)
         timeframe = params.get('timeframe', '15m')
+        max_positions = params.get('max_positions', 5)
 
         if BOT_PROCESS is None or BOT_PROCESS.poll() is not None:
             py_exec = get_python_executable()
@@ -287,7 +288,8 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                 '--margin-pct', str(margin_pct),
                 '--leverage', str(leverage),
                 '--threshold', str(threshold),
-                '--timeframe', str(timeframe)
+                '--timeframe', str(timeframe),
+                '--max-positions', str(max_positions)
             ]
             try:
                 log_file = open(LOG_FILE_PATH, 'a', encoding='utf-8')
