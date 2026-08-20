@@ -288,6 +288,7 @@ d:\Bot2\
 │   └── backtest_fibonacci_standalone.py
 ├── backtests/
 │   ├── historical_data_cache/             # Real Binance Futures OHLCV candle datasets
+│   ├── backtest_1year_complete_engine.py  # Full 1-Year (365-Day+) Option B Backtester
 │   ├── backtest_weather_fibonacci_ensemble.py  # Option B Dual-Alpha Backtest Engine
 │   ├── backtest_live_bot_fibonacci.py     # Live production bot direct backtester
 │   └── backtest_fibonacci_standalone.py   # Pure Fibonacci mathematical engine
@@ -319,9 +320,9 @@ TELEGRAM_NOTIFICATIONS=true
 python weather_ensemble_bot.py --trade-live --timeframe 15m --leverage 50 --margin-pct 0.03 --max-positions 5
 ```
 
-### 3. Run Historical Backtest with Full Fee Friction
+### 3. Run Full 1-Year (365-Day+) Historical Backtest
 ```powershell
-python backtests/backtest_weather_fibonacci_ensemble.py --leverage 50 --margin-pct 0.03 --max-positions 5 --fee-tier vip0_bnb
+python backtests/backtest_1year_complete_engine.py --leverage 50 --margin-pct 0.03 --max-positions 5 --fee-tier vip0_bnb
 ```
 
 ---
