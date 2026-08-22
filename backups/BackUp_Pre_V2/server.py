@@ -13,7 +13,7 @@ import json
 import subprocess
 import urllib.parse
 from datetime import datetime, timezone
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Import Binance helper functions from weather_ensemble_bot
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -98,21 +98,10 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         if path in ['/', '']:
             path = '/index.html'
 
-        # Check in frontend/dist first, then web/, fallback to PROJECT_DIR
-        candidate_dist = os.path.normpath(os.path.join(PROJECT_DIR, 'frontend', 'dist', path.lstrip('/')))
-        candidate_web = os.path.normpath(os.path.join(PROJECT_DIR, 'web', path.lstrip('/')))
-        candidate_root = os.path.normpath(os.path.join(PROJECT_DIR, path.lstrip('/')))
-
-        if os.path.exists(candidate_dist) and os.path.isfile(candidate_dist):
-            filepath = candidate_dist
-        elif os.path.exists(candidate_web) and os.path.isfile(candidate_web):
-            filepath = candidate_web
-        elif os.path.exists(candidate_root) and os.path.isfile(candidate_root):
-            filepath = candidate_root
-        else:
-            # Fallback to SPA index.html
-            spa_index = os.path.join(PROJECT_DIR, 'frontend', 'dist', 'index.html')
-            filepath = spa_index if os.path.exists(spa_index) else candidate_root
+        filepath = os.path.normpath(os.path.join(PROJECT_DIR, path.lstrip('/')))
+        if not filepath.startswith(PROJECT_DIR):
+            self.send_error(403, "Forbidden")
+            return
 
         if os.path.exists(filepath) and os.path.isfile(filepath):
             _, ext = os.path.splitext(filepath)
@@ -287,8 +276,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         leverage = params.get('leverage', 50)
         threshold = params.get('threshold', 30)
         timeframe = params.get('timeframe', '15m')
-        max_positions = params.get('max_positions', 8)
-        directional_cap = params.get('directional_cap', 4)
+        max_positions = params.get('max_positions', 5)
 
         if BOT_PROCESS is None or BOT_PROCESS.poll() is not None:
             py_exec = get_python_executable()
@@ -301,8 +289,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                 '--leverage', str(leverage),
                 '--threshold', str(threshold),
                 '--timeframe', str(timeframe),
-                '--max-positions', str(max_positions),
-                '--directional-cap', str(directional_cap)
+                '--max-positions', str(max_positions)
             ]
             try:
                 log_file = open(LOG_FILE_PATH, 'a', encoding='utf-8')
@@ -334,15 +321,12 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         self.send_json_response(200, res)
 
     def send_json_response(self, code, data):
-        try:
-            self.send_response(code)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-            self.end_headers()
-            self.wfile.write(json.dumps(data).encode('utf-8'))
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, Exception):
-            pass
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -353,7 +337,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     os.chdir(PROJECT_DIR)
-    server = ThreadingHTTPServer(('0.0.0.0', PORT), WebDashboardHandler)
+    server = HTTPServer(('0.0.0.0', PORT), WebDashboardHandler)
     print(f"=======================================================")
     print(f" WEATHER-ENSEMBLE WEB DASHBOARD & BOT CONTROL SERVER ACTIVE")
     print(f" URL: http://localhost:{PORT}")

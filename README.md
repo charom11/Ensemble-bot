@@ -1,11 +1,11 @@
-# ⚡ WEATHER-ENSEMBLE + FIBONACCI QUANT TRADING SYSTEM
-### *Autonomous 31-Model Consensus Matrix, Objective Fibonacci Geometry & Option B Trailing Stop Engine*
+# ⚡ WEATHER-ENSEMBLE + FIBONACCI QUANT TRADING SYSTEM (V2)
+### *Autonomous 31-Model Consensus Matrix, 3-Stage Scale-Out & 1H MSS Fast Reversal Engine*
 
 <div align="center">
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Binance](https://img.shields.io/badge/Exchange-Binance_Futures-F0B90B?style=for-the-badge&logo=binance&logoColor=black)
-![Timeframe](https://img.shields.io/badge/Timeframe-15m_Default-00F2FE?style=for-the-badge)
+![Risk](https://img.shields.io/badge/Risk-3%25_Margin_%40_50x-00F2FE?style=for-the-badge)
 ![Ensemble](https://img.shields.io/badge/Models-31_Ensemble_Pillars-7928CA?style=for-the-badge)
 ![Consistency](https://img.shields.io/badge/Monthly_Win_Rate-100%25_Green-2EA44F?style=for-the-badge)
 ![Telegram](https://img.shields.io/badge/C2_Mobile-1--Tap_Telegram-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)
@@ -17,12 +17,12 @@
 ## 🌪️ The Quantitative Paradigm
 
 ```
-  TRADITIONAL RETAIL BOT (Fragile)            WEATHER-ENSEMBLE + FIBONACCI (Antifragile)
+  TRADITIONAL RETAIL BOT (Fragile)            WEATHER-ENSEMBLE V2 UPGRADED (Antifragile)
  ┌────────────────────────────────┐         ┌───────────────────────────────────────────────┐
  │ 1 Single Indicator (e.g. RSI)  │         │ 1️⃣ Objective Fibonacci Retracement (0.618 GP) │
  │ ❌ 1 Fakeout = Direct Loss     │   VS    │ 2️⃣ 31-Model Ensemble Matrix (9 Quant Pillars) │
- │ ❌ 60% False Positive Rate     │         │ 3️⃣ 4H SMC Macro & 15m BTC Beta Health Filter │
- │ ❌ Chases Late Breakouts       │         │ 4️⃣ Option B: 50% Scale-Out + TP2 Trailing SL  │
+ │ ❌ 60% False Positive Rate     │         │ 3️⃣ 1H MSS Reversal Speed + ADX(14) Chop Gate  │
+ │ ❌ Chases Late Breakouts       │         │ 4️⃣ 3-Stage Scale-Out (33% / 33% / 34% Runner) │
  └────────────────────────────────┘         └───────────────────────────────────────────────┘
                                                 ↳ No Confluence? ZERO Trade.
 ```

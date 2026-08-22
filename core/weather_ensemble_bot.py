@@ -81,6 +81,15 @@ class CircuitBreakerManager:
         self.circuit_tripped = False
         self.trip_reason = ""
         self.asset_cooldowns = {} # symbol -> cooldown_until_timestamp
+        
+        # Upgrade 5: Automated Daily Performance Ledger
+        self.current_utc_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.trades_today = 0
+        self.wins_today = 0
+        self.losses_today = 0
+        self.realized_pnl_today = 0.0
+        self.best_win_today = 0.0
+        self.worst_loss_today = 0.0
 
     def is_asset_in_cooldown(self, symbol):
         until = self.asset_cooldowns.get(symbol, 0)
@@ -91,13 +100,27 @@ class CircuitBreakerManager:
         print(f"[ASSET COOLDOWN] #{symbol} paused for {duration_seconds/60:.0f} mins to prevent knife-catching.")
 
     def check_and_update(self, current_balance):
-        now = time.time()
-        if self.daily_start_balance is None or (now - self.daily_start_time) >= 86400:
+        now_dt = datetime.now(timezone.utc)
+        today_str = now_dt.strftime("%Y-%m-%d")
+
+        # Check for 00:00 UTC Daily Rollover -> Broadcast Daily Report
+        if today_str != self.current_utc_day:
+            self.broadcast_daily_summary_report(current_balance)
+            self.current_utc_day = today_str
             self.daily_start_balance = current_balance
-            self.daily_start_time = now
+            self.daily_start_time = time.time()
             self.consecutive_losses = 0
+            self.trades_today = 0
+            self.wins_today = 0
+            self.losses_today = 0
+            self.realized_pnl_today = 0.0
+            self.best_win_today = 0.0
+            self.worst_loss_today = 0.0
             self.circuit_tripped = False
             self.trip_reason = ""
+
+        if self.daily_start_balance is None:
+            self.daily_start_balance = current_balance
 
         if self.daily_start_balance and self.daily_start_balance > 0:
             dd = (self.daily_start_balance - current_balance) / self.daily_start_balance
@@ -114,16 +137,47 @@ class CircuitBreakerManager:
         return True
 
     def record_trade_result(self, pnl):
+        self.trades_today += 1
+        self.realized_pnl_today += pnl
         if pnl < 0:
             self.consecutive_losses += 1
+            self.losses_today += 1
+            self.worst_loss_today = min(self.worst_loss_today, pnl)
         else:
             self.consecutive_losses = 0
+            self.wins_today += 1
+            self.best_win_today = max(self.best_win_today, pnl)
 
     def reset_circuit(self, current_balance):
         self.daily_start_balance = current_balance
         self.consecutive_losses = 0
         self.circuit_tripped = False
         self.trip_reason = ""
+
+    def broadcast_daily_summary_report(self, ending_balance):
+        """Upgrade 5: Automated Daily Performance Ledger Broadcast (00:00 UTC)"""
+        start_b = self.daily_start_balance or ending_balance
+        net_pnl = ending_balance - start_b
+        pnl_pct = (net_pnl / start_b * 100) if start_b > 0 else 0.0
+        wr = (self.wins_today / self.trades_today * 100) if self.trades_today > 0 else 0.0
+        status_emoji = "🟩 PROFITABLE DAY" if net_pnl >= 0 else "🟥 DRAWDOWN DAY"
+
+        msg = (
+            f"📊 <b>AUTOMATED DAILY PERFORMANCE LEDGER (00:00 UTC)</b>\n\n"
+            f"<b>Status:</b> {status_emoji}\n"
+            f"<b>Date:</b> {self.current_utc_day}\n"
+            f"<b>Starting Balance:</b> ${start_b:,.2f} USDT\n"
+            f"<b>Ending Balance:</b> ${ending_balance:,.2f} USDT\n"
+            f"<b>Net Daily Realized PnL:</b> <b>{net_pnl:+,.2f} USDT ({pnl_pct:+.2f}%)</b>\n"
+            f"<b>Trades Completed:</b> {self.trades_today} ({self.wins_today}W / {self.losses_today}L)\n"
+            f"<b>Daily Win Rate:</b> <b>{wr:.1f}%</b>\n"
+            f"<b>Best Win:</b> +${self.best_win_today:,.2f} USDT\n"
+            f"<b>Worst Loss:</b> -${abs(self.worst_loss_today):,.2f} USDT\n"
+            f"<b>Circuit Health:</b> {'🟢 NORMAL' if not self.circuit_tripped else '🛑 TRIPPED'}\n\n"
+            f"<i>⚡ Weather-Ensemble AI V2 Upgraded Engine Active</i>"
+        )
+        send_telegram_msg(msg, reply_markup=get_telegram_inline_keyboard())
+        print(f"\n[DAILY REPORT BROADCAST] {self.current_utc_day} | Net PnL: {net_pnl:+,.2f} USDT | Win Rate: {wr:.1f}%\n", flush=True)
 
 CIRCUIT_BREAKER = CircuitBreakerManager()
 
@@ -674,8 +728,27 @@ def get_binance_futures_positions():
 def get_binance_futures_open_positions_count():
     return len(get_binance_futures_positions())
 
+def cancel_binance_symbol_all_orders(symbol):
+    """
+    Cancels all open regular orders AND open conditional algo orders (Stop Loss / Take Profit) for a symbol.
+    """
+    try:
+        # 1. Cancel regular open orders
+        binance_futures_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': symbol})
+        
+        # 2. Cancel all open algo conditional orders (SL/TP)
+        open_algo = binance_futures_signed_request('GET', '/fapi/v1/openAlgoOrders')
+        if isinstance(open_algo, list):
+            for a in open_algo:
+                if a.get('symbol') == symbol:
+                    algo_id = a.get('algoId')
+                    if algo_id:
+                        binance_futures_signed_request('DELETE', '/fapi/v1/algoOrder', {'algoId': algo_id})
+    except Exception as e:
+        print(f"[CANCEL ALL ORDERS ERROR] {symbol}: {e}", flush=True)
+
 def close_binance_futures_position(symbol):
-    """Emergency closes a specific open position"""
+    """Emergency closes a specific open position and cancels all remaining orders"""
     positions = get_binance_futures_positions()
     target = None
     for p in positions:
@@ -683,6 +756,7 @@ def close_binance_futures_position(symbol):
             target = p
             break
     if not target:
+        cancel_binance_symbol_all_orders(symbol)
         return {'status': 'not_found', 'message': f'No open position found for {symbol}'}
 
     amt = abs(target['positionAmt'])
@@ -696,6 +770,7 @@ def close_binance_futures_position(symbol):
         'reduceOnly': 'true'
     }
     res = binance_futures_signed_request('POST', '/fapi/v1/order', params)
+    cancel_binance_symbol_all_orders(symbol)
     return res
 
 def close_all_binance_futures_positions():
@@ -723,39 +798,42 @@ def cleanup_orphaned_orders():
         active_positions = get_binance_futures_positions()
         active_symbols = set(p['symbol'] for p in active_positions if float(p.get('positionAmt', 0.0)) != 0.0)
 
+        cleaned_count = 0
+        cleaned_symbols = set()
+
         # 1. Regular Open Orders (TP Limit Orders)
         open_orders = binance_futures_signed_request('GET', '/fapi/v1/openOrders')
         if isinstance(open_orders, list):
             for o in open_orders:
                 sym = o.get('symbol')
                 if sym and sym not in active_symbols:
-                    print(f"[ORPHANED ORDER CLEANER] Cancelling leftover Limit order #{o.get('orderId')} for #{sym}...")
+                    oid = o.get('orderId')
+                    print(f"[ORPHANED ORDER CLEANER] Cancelling leftover Limit order #{oid} for #{sym}...", flush=True)
+                    binance_futures_signed_request('DELETE', '/fapi/v1/order', {'symbol': sym, 'orderId': oid})
                     binance_futures_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': sym})
-                    send_telegram_msg(f"🧹 <b>ORPHANED ORDER CLEANER</b>\n\nCancelled leftover open Limit TP order for #{sym} (position is closed).")
+                    cleaned_count += 1
+                    cleaned_symbols.add(sym)
 
-        # 2. Algo Open Orders (Conditional Stop Losses)
+        # 2. Algo Open Orders (Conditional Stop Losses & Take Profits)
         open_algo = binance_futures_signed_request('GET', '/fapi/v1/openAlgoOrders')
         if isinstance(open_algo, list):
             for a in open_algo:
                 sym = a.get('symbol')
                 if sym and sym not in active_symbols:
                     algo_id = a.get('algoId')
-                    print(f"[ORPHANED ORDER CLEANER] Cancelling leftover Algo SL #{algo_id} for #{sym}...")
-                    try:
-                        import ccxt
-                        exchange = ccxt.binance({
-                            'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
-                            'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
-                            'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
-                        })
-                        exchange.load_time_difference()
-                        ccxt_sym = sym.replace('USDT', '/USDT:USDT')
-                        exchange.cancel_order(id=str(algo_id), symbol=ccxt_sym)
-                    except Exception:
-                        pass
-                    send_telegram_msg(f"🧹 <b>ORPHANED ORDER CLEANER</b>\n\nCancelled leftover Algo Stop Loss for #{sym} (position is closed).")
-    except Exception:
-        pass
+                    order_type = a.get('orderType', 'CONDITIONAL')
+                    print(f"[ORPHANED ORDER CLEANER] Cancelling leftover Algo {order_type} #{algo_id} for #{sym}...", flush=True)
+                    res = binance_futures_signed_request('DELETE', '/fapi/v1/algoOrder', {'algoId': algo_id})
+                    cleaned_count += 1
+                    cleaned_symbols.add(sym)
+
+        if cleaned_count > 0:
+            syms_str = ", ".join(f"#{s}" for s in cleaned_symbols)
+            send_telegram_msg(f"🧹 <b>ORPHANED ORDER CLEANER</b>\n\nCleaned up <b>{cleaned_count}</b> leftover order(s) for closed position(s): {syms_str}")
+        return cleaned_count
+    except Exception as e:
+        print(f"[ORPHANED ORDER CLEANER ERROR] {e}", flush=True)
+        return 0
 
 # --------------------------------------------------------------------------
 # L2 Order Book Depth Imbalance & Funding Rate Squeeze Filters
@@ -843,6 +921,234 @@ def check_4h_smc_bias(symbol, target_side):
     except Exception:
         return True, 'NEUTRAL'
 
+# --------------------------------------------------------------------------
+# Upgrade 1: Faster Trend Reversal Detection (Dual 1H/15m Market Structure Shift)
+# --------------------------------------------------------------------------
+def detect_1h_mss_from_api(symbol, window=3):
+    """
+    Detects 1H Market Structure Shift (MSS) with Volume Surge:
+    - Bearish MSS: 1H candle breaks below previous key confirmed swing low with heavy volume.
+    - Bullish MSS: 1H candle breaks above previous key confirmed swing high with heavy volume.
+    """
+    try:
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1h&limit=45"
+        r = requests.get(url, timeout=4)
+        if r.status_code != 200:
+            return 'NEUTRAL'
+        raw = r.json()
+        if len(raw) < window * 2 + 5:
+            return 'NEUTRAL'
+
+        highs = np.array([float(k[2]) for k in raw])
+        lows = np.array([float(k[3]) for k in raw])
+        closes = np.array([float(k[4]) for k in raw])
+        volumes = np.array([float(k[5]) for k in raw])
+
+        sh_list, sl_list = detect_fractal_swings_series(highs, lows, window=window)
+        if not sh_list or not sl_list:
+            return 'NEUTRAL'
+
+        last_sh_price = sh_list[-1][1]
+        last_sl_price = sl_list[-1][1]
+        curr_close = closes[-1]
+        curr_low = lows[-1]
+        curr_high = highs[-1]
+        vol_sma20 = np.mean(volumes[-20:]) if len(volumes) >= 20 else volumes[-1]
+        is_vol_surge = volumes[-1] >= (vol_sma20 * 1.15)
+
+        # Bearish MSS: Broke below last swing low
+        if (curr_low < last_sl_price and curr_close < last_sl_price) and is_vol_surge:
+            return 'BEARISH'
+
+        # Bullish MSS: Broke above last swing high
+        if (curr_high > last_sh_price and curr_close > last_sh_price) and is_vol_surge:
+            return 'BULLISH'
+
+        return 'NEUTRAL'
+    except Exception:
+        return 'NEUTRAL'
+
+def check_macro_and_mss_bias(symbol, target_side):
+    """
+    Combines 1H MSS (Fast Reversal Agility) + 4H SMC Macro Alignment:
+    - If 1H MSS has broken structure with volume, flips bias immediately without waiting for 4H close.
+    - Otherwise falls back to standard 4H SMC EMA20/50 alignment.
+    """
+    # 1. Check 1H MSS First for Fast Reversal
+    mss_1h = detect_1h_mss_from_api(symbol)
+    if mss_1h == 'BEARISH' and target_side.upper() in ['BUY', 'LONG']:
+        return False, 'BEARISH (1H Market Structure Shift Reversal Broken Down 🛑)'
+    elif mss_1h == 'BULLISH' and target_side.upper() in ['SELL', 'SHORT']:
+        return False, 'BULLISH (1H Market Structure Shift Reversal Broken Up 🟢)'
+    elif (mss_1h == 'BULLISH' and target_side.upper() in ['BUY', 'LONG']) or (mss_1h == 'BEARISH' and target_side.upper() in ['SELL', 'SHORT']):
+        return True, f"{mss_1h} (1H MSS Reversal Confirmed ⚡)"
+
+    # 2. Fallback to 4H SMC Macro Bias
+    return check_4h_smc_bias(symbol, target_side)
+
+# --------------------------------------------------------------------------
+# Upgrade 2: Choppy Market / ADX Regime Filter (Anti-Whipsaw Protection)
+# --------------------------------------------------------------------------
+def calc_adx_series(highs, lows, closes, period=14):
+    """
+    Calculates Average Directional Index (ADX) from price series.
+    ADX < 20 = Flat sideways chop zone / low trend strength.
+    ADX >= 20 = Active trending market.
+    """
+    n = len(closes)
+    if n < period * 2 + 1:
+        return 25.0
+
+    tr = np.zeros(n)
+    for i in range(1, n):
+        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+
+    plus_dm = np.zeros(n)
+    minus_dm = np.zeros(n)
+    for i in range(1, n):
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+        if up_move > down_move and up_move > 0:
+            plus_dm[i] = up_move
+        if down_move > up_move and down_move > 0:
+            minus_dm[i] = down_move
+
+    def wilder_smooth(arr, p):
+        res = np.zeros(len(arr))
+        res[p] = np.sum(arr[1:p + 1])
+        for i in range(p + 1, len(arr)):
+            res[i] = res[i - 1] - (res[i - 1] / p) + arr[i]
+        return res
+
+    atr_s = wilder_smooth(tr, period)
+    plus_s = wilder_smooth(plus_dm, period)
+    minus_s = wilder_smooth(minus_dm, period)
+
+    plus_di = np.zeros(n)
+    minus_di = np.zeros(n)
+    dx = np.zeros(n)
+    for i in range(period, n):
+        if atr_s[i] > 0:
+            plus_di[i] = 100.0 * plus_s[i] / atr_s[i]
+            minus_di[i] = 100.0 * minus_s[i] / atr_s[i]
+        di_sum = plus_di[i] + minus_di[i]
+        if di_sum > 0:
+            dx[i] = 100.0 * abs(plus_di[i] - minus_di[i]) / di_sum
+
+    adx = np.zeros(n)
+    start_idx = period * 2
+    if start_idx < n:
+        adx[start_idx] = np.mean(dx[period:start_idx + 1])
+        for i in range(start_idx + 1, n):
+            adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+
+    return float(adx[-1]) if n > 0 else 25.0
+
+def check_btc_adx_market_regime(adx_chop_threshold=20):
+    """
+    Checks Bitcoin 15m ADX(14) to determine market-wide volatility regime.
+    Returns: (is_trending, adx_val, desc)
+    """
+    try:
+        url = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=45"
+        r = requests.get(url, timeout=3)
+        if r.status_code != 200:
+            return True, 25.0, "ADX Unavailable (Allowed)"
+        raw = r.json()
+        h = np.array([float(k[2]) for k in raw])
+        l = np.array([float(k[3]) for k in raw])
+        c = np.array([float(k[4]) for k in raw])
+        adx_val = calc_adx_series(h, l, c, period=14)
+
+        if adx_val < adx_chop_threshold:
+            return False, round(adx_val, 1), f"Chop Zone (ADX {adx_val:.1f} < {adx_chop_threshold} - Low Volatility ⚠️)"
+        return True, round(adx_val, 1), f"Trending Market (ADX {adx_val:.1f} >= {adx_chop_threshold} 🌊)"
+    except Exception:
+        return True, 25.0, "ADX Check Exception"
+
+# --------------------------------------------------------------------------
+# Upgrade 3: Sector & Directional Exposure Cap (Correlation Protection)
+# --------------------------------------------------------------------------
+SECTOR_MAP = {
+    'BTCUSDT': 'MAJORS',
+    'ETHUSDT': 'MAJORS',
+    'SOLUSDT': 'L1_HIGH_BETA',
+    'AVAXUSDT': 'L1_HIGH_BETA',
+    'NEARUSDT': 'L1_HIGH_BETA',
+    'SUIUSDT': 'L1_HIGH_BETA',
+    'APTUSDT': 'L1_HIGH_BETA',
+    'ADAUSDT': 'L1_HIGH_BETA',
+    'BNBUSDT': 'EXCHANGE_L1',
+    'RENDERUSDT': 'AI_ORACLE',
+    'LINKUSDT': 'AI_ORACLE',
+    'DOGEUSDT': 'MEME',
+    'XRPUSDT': 'PAYMENTS_L1',
+    'PAXGUSDT': 'COMMODITY_STORE'
+}
+
+LAST_ENTRY_TIMESTAMPS = {}
+
+def check_directional_portfolio_cap(symbol, target_side, max_same_dir=3, max_per_sector=2):
+    """
+    Caps total open positions in the same direction at max 3 and max 2 per sector.
+    Positions where Stop-Loss has already shifted to Breakeven (risk-free) do not count against the cap.
+    Enforces a 15-minute inter-trade cooldown between same-direction new entries.
+    """
+    global ACTIVE_POSITION_TARGETS, LAST_ENTRY_TIMESTAMPS
+    try:
+        # 1. Staggered Entry Cooldown (15-min spacing between same-direction entries)
+        dir_key = 'BUY' if target_side.upper() in ['BUY', 'LONG'] else 'SELL'
+        last_dir_time = LAST_ENTRY_TIMESTAMPS.get(dir_key, 0)
+        time_since = time.time() - last_dir_time
+        if time_since < 900 and last_dir_time > 0: # 15 minutes
+            mins_left = (900 - time_since) / 60
+            return False, 0, f"Staggered Entry Cooldown Active ({mins_left:.1f}m left before adding next {dir_key} position ⏳)"
+
+        positions = get_binance_futures_positions()
+        if not positions:
+            return True, 0, "No Active Positions"
+
+        long_risk_count = 0
+        short_risk_count = 0
+        sector_risk_counts = {}
+
+        for p in positions:
+            sym = p['symbol']
+            amt = float(p.get('positionAmt', 0.0))
+            if abs(amt) == 0.0:
+                continue
+
+            side = 'LONG' if amt > 0 else 'SHORT'
+            target = ACTIVE_POSITION_TARGETS.get(sym, {})
+            # If position has already scaled out at TP1 and is at Breakeven, it is risk-free
+            if target.get('tp1_hit'):
+                continue
+
+            sec = SECTOR_MAP.get(sym, 'OTHER')
+            sector_risk_counts[sec] = sector_risk_counts.get(sec, 0) + 1
+
+            if side == 'LONG':
+                long_risk_count += 1
+            else:
+                short_risk_count += 1
+
+        is_long = target_side.upper() in ['BUY', 'LONG']
+        active_same_dir = long_risk_count if is_long else short_risk_count
+
+        if active_same_dir >= max_same_dir:
+            side_str = "LONG" if is_long else "SHORT"
+            return False, active_same_dir, f"Max {max_same_dir} {side_str} positions active ({active_same_dir}/{max_same_dir}) 🛡️"
+
+        # Sector Cap Check
+        target_sector = SECTOR_MAP.get(symbol, 'OTHER')
+        curr_sector_count = sector_risk_counts.get(target_sector, 0)
+        if curr_sector_count >= max_per_sector:
+            return False, curr_sector_count, f"Sector Cap reached for {target_sector} ({curr_sector_count}/{max_per_sector} active) 🛡️"
+
+        return True, active_same_dir, "Directional & Sector Cap OK"
+    except Exception:
+        return True, 0, "Cap Check Exception"
+
 def check_order_flow_absorption(symbol, target_side, trades_limit=500):
     """
     Real-Time Order Flow & Passive Absorption Filter:
@@ -900,17 +1206,25 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
     if last_price is None or last_price <= 0:
         return None
 
-    # Institutional Asymmetric R:R: SL 0.9x ATR | TP1 1.5x ATR (Maker 0.02%) | Runner TP2 3.2x ATR
+    # Institutional Asymmetric R:R: SL 1.5x ATR (Noise Buffer) | TP1 1.8x ATR (Scale-Out) | Runner TP2 3.2x ATR
+    atr_buffer = float(atr) if (atr and atr > 0) else float(last_price * 0.010)
+    
     if custom_tp and custom_tp > 0:
         tp1_price = float(custom_tp)
     else:
-        tp1_dist = 1.5 * atr if atr else (last_price * 0.015)
+        tp1_dist = 1.8 * atr_buffer
         tp1_price = (last_price + tp1_dist) if side.upper() in ['BUY', 'LONG'] else (last_price - tp1_dist)
 
     if custom_sl and custom_sl > 0:
-        sl_price = float(custom_sl)
+        raw_sl = float(custom_sl)
+        # Ensure custom SL provides at least 1.2x ATR breathing room
+        min_sl_dist = 1.2 * atr_buffer
+        if side.upper() in ['BUY', 'LONG']:
+            sl_price = min(raw_sl, last_price - min_sl_dist)
+        else:
+            sl_price = max(raw_sl, last_price + min_sl_dist)
     else:
-        sl_dist = 0.9 * atr if atr else (last_price * 0.009)
+        sl_dist = 1.5 * atr_buffer
         sl_price = (last_price - sl_dist) if side.upper() in ['BUY', 'LONG'] else (last_price + sl_dist)
 
     act_price = tp1_price
@@ -923,14 +1237,17 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
     sl_str = f"{sl_price:.{price_prec}f}"
     act_str = f"{act_price:.{price_prec}f}"
 
-    half_qty_str = None
-    if total_qty and total_qty > 0:
-        half_qty = round(total_qty * 0.5, qty_prec)
-        if qty_prec == 0:
-            half_qty = int(half_qty)
-        half_qty_str = str(half_qty)
+    # Upgrade 4: 3-Stage Scale-Out Engine (33% TP1 / 33% TP2 / 34% TP3 Runner)
+    one_third_qty = round(total_qty * 0.33, qty_prec) if (total_qty and total_qty > 0) else None
+    if qty_prec == 0 and one_third_qty:
+        one_third_qty = int(one_third_qty)
 
-    # 1. Take Profit Order (Native TAKE_PROFIT_MARKET on Binance Conditional Orders)
+    # If 33% size meets Binance $5.00 min notional, place TP1 for 33% of position
+    # Otherwise, place TP1 for full size
+    tp1_qty = one_third_qty if (one_third_qty and (one_third_qty * last_price >= 5.05)) else total_qty
+    tp1_qty_str = str(int(tp1_qty)) if qty_prec == 0 else f"{tp1_qty:.{qty_prec}f}"
+
+    # 1. Take Profit Order (33% scale-out @ TP1 on Binance Conditional Orders)
     tp_res = None
     sl_res = None
     try:
@@ -943,17 +1260,17 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
         exchange.load_time_difference()
         ccxt_sym = symbol.replace('USDT', '/USDT:USDT')
         
-        # Place Take Profit
+        # Place TP1 for 33% size
         tp_order = exchange.create_order(
             symbol=ccxt_sym,
             type='TAKE_PROFIT_MARKET',
             side=close_side.lower(),
-            amount=float(total_qty),
+            amount=float(tp1_qty_str),
             params={'stopPrice': float(tp1_str), 'positionSide': position_side}
         )
-        tp_res = {'status': 'success', 'id': tp_order.get('id'), 'price': tp1_str}
+        tp_res = {'status': 'success', 'id': tp_order.get('id'), 'price': tp1_str, 'qty': tp1_qty_str}
         
-        # Place Stop Loss
+        # Place Initial Protective SL for full position
         sl_order = exchange.create_order(
             symbol=ccxt_sym,
             type='STOP_MARKET',
@@ -963,13 +1280,13 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
         )
         sl_res = {'status': 'success', 'id': sl_order.get('id'), 'price': sl_str}
     except Exception as e:
-        # Fallback to direct signed API if CCXT has issues
+        # Fallback to direct signed API
         tp_params = {
             'symbol': symbol,
             'side': close_side,
             'type': 'TAKE_PROFIT_MARKET',
             'stopPrice': tp1_str,
-            'closePosition': 'true',
+            'quantity': tp1_qty_str,
             'positionSide': position_side
         }
         tp_res = binance_futures_signed_request('POST', '/fapi/v1/order', tp_params)
@@ -984,30 +1301,43 @@ def place_binance_futures_tp_sl(symbol, side, last_price, atr, leverage=50, tota
         }
         sl_res = binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
 
-    # Record targets for automated Breakeven trailing stop daemon
+    # Record targets for Upgrade 4: 3-Stage Scale-Out Daemon
     global ACTIVE_POSITION_TARGETS
+    tp2_dist = 2.4 * atr if atr else (last_price * 0.024)
+    tp2_calc = (last_price + tp2_dist) if side.upper() in ['BUY', 'LONG'] else (last_price - tp2_dist)
+
     ACTIVE_POSITION_TARGETS[symbol] = {
         'side': side.upper(),
         'entry_price': last_price,
         'tp1': float(tp1_str),
+        'tp2': float(tp2_calc),
         'sl': float(sl_str),
-        'qty': float(total_qty) if total_qty else 0.0,
-        'be_moved': False
+        'current_sl': float(sl_str),
+        'initial_qty': float(total_qty),
+        'tp1_qty': float(tp1_qty),
+        'atr': float(atr) if (atr and atr > 0) else float(last_price * 0.008),
+        'tp1_hit': False,
+        'tp2_hit': False,
+        'highest_mark': last_price,
+        'lowest_mark': last_price,
+        'trailing_active': False
     }
 
-    print(f"[ORDERS PLACED] {symbol} {side} | TP Target (Take Profit Market): ${tp1_str} | SL (Stop Market): ${sl_str}", flush=True)
+    scale_desc = f"33% Scale-Out ({tp1_qty_str} Qty)" if (tp1_qty < total_qty) else f"100% Size ({total_qty} Qty)"
+    print(f"[ORDERS PLACED] {symbol} {side} | TP1 Target: ${tp1_str} [{scale_desc}] | SL: ${sl_str} (3-Stage Scale-Out + TP3 Trailing Stop Ready)", flush=True)
     return {'tp_price': tp1_str, 'sl_price': sl_str, 'act_price': act_str, 'tp_res': tp_res, 'sl_res': sl_res}
 
 # --------------------------------------------------------------------------
-# Automated Real-Time Breakeven & Trailing Stop Daemon
+# Upgrade 4: 3-Stage Scale-Out & Dynamic Trailing Stop Daemon
 # --------------------------------------------------------------------------
 ACTIVE_POSITION_TARGETS = {}
 
 def manage_active_positions_breakeven():
     """
-    Real-time Breakeven & Trailing Stop Daemon:
-    - Scans open positions on Binance every cycle
-    - When price crosses TP1 (0.000 Retest), automatically moves SL to Breakeven (entry_price + fee buffer)
+    Upgrade 4: 3-Stage Scale-Out & Real-Time Trailing Stop Daemon:
+    - Stage 1 (TP1 Hit @ 33%): Moves SL to Breakeven (+0.05% fee cover buffer) on remaining 67%.
+    - Stage 2 (TP2 Hit @ 33%): Closes 33% at structural target and tightens trailing stop to 0.8x ATR.
+    - Stage 3 (TP3 Runner @ 34%): Dynamic 1.2x ATR trailing stop walks behind price.
     """
     global ACTIVE_POSITION_TARGETS
     try:
@@ -1026,60 +1356,199 @@ def manage_active_positions_breakeven():
                 continue
 
             target = ACTIVE_POSITION_TARGETS.get(sym)
-            if not target or target.get('be_moved'):
+            if not target:
                 continue
 
             side = 'LONG' if amt > 0 else 'SHORT'
             mark_p = float(p.get('markPrice', 0.0))
             entry_p = float(p.get('entryPrice', target.get('entry_price', 0.0)))
             tp1_p = target.get('tp1', 0.0)
+            tp2_p = target.get('tp2', 0.0)
+            atr_val = target.get('atr', entry_p * 0.008)
 
             if entry_p <= 0 or tp1_p <= 0:
                 continue
 
-            # Check if price has reached or crossed TP1 level
-            hit_tp1 = (side == 'LONG' and mark_p >= tp1_p) or (side == 'SHORT' and mark_p <= tp1_p)
+            price_prec, qty_prec = get_symbol_precision(sym)
+            close_side = 'SELL' if side == 'LONG' else 'BUY'
 
-            if hit_tp1:
-                # 1. Cancel old Stop Loss orders for this symbol
-                binance_futures_signed_request('DELETE', '/fapi/v1/allOpenOrders', {'symbol': sym})
-                
-                # 2. Place new Stop Market at Breakeven (with 0.03% fee buffer)
-                price_prec, qty_prec = get_symbol_precision(sym)
-                be_price = entry_p * 1.0005 if side == 'LONG' else entry_p * 0.9995
-                be_str = f"{be_price:.{price_prec}f}"
-                close_side = 'SELL' if side == 'LONG' else 'BUY'
+            # --- STAGE 1: Detect TP1 Hit (33% Scaled Out) & Shift Stop Loss to Breakeven ---
+            if not target.get('tp1_hit'):
+                hit_tp1 = (side == 'LONG' and mark_p >= tp1_p) or (side == 'SHORT' and mark_p <= tp1_p) or (abs(amt) <= (target['initial_qty'] * 0.75))
+                if hit_tp1:
+                    be_price = entry_p * 1.0005 if side == 'LONG' else entry_p * 0.9995
+                    be_str = f"{be_price:.{price_prec}f}"
 
-                try:
-                    import ccxt
-                    exchange = ccxt.binance({
-                        'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
-                        'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
-                        'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
-                    })
-                    exchange.load_time_difference()
-                    ccxt_sym = sym.replace('USDT', '/USDT:USDT')
-                    exchange.create_order(
-                        symbol=ccxt_sym,
-                        type='STOP_MARKET',
-                        side=close_side.lower(),
-                        amount=abs(amt),
-                        params={'stopPrice': float(be_str), 'positionSide': side}
-                    )
-                except Exception:
-                    sl_params = {
-                        'symbol': sym,
-                        'side': close_side,
-                        'type': 'STOP_MARKET',
-                        'stopPrice': be_str,
-                        'closePosition': 'true',
-                        'positionSide': side
-                    }
-                    binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
+                    # Cancel old initial SL
+                    cancel_binance_symbol_all_orders(sym)
 
-                target['be_moved'] = True
-                print(f"🛡️ [BREAKEVEN ACTIVATED] #{sym} reached TP1! Protective SL moved to Entry (${be_str}) — Guaranteed Net Green!", flush=True)
-                send_telegram_msg(f"🛡️ <b>BREAKEVEN STOP LOSS ACTIVATED</b>\n\n• Asset: <b>#{sym}</b> ({side})\n• Mark Price: <b>${mark_p:,.4f}</b> (TP1 Reached 🎯)\n• New Stop Loss: <b>${be_str}</b> (Breakeven Locked 🔒)\n\n<i>This trade is now 100% risk-free!</i>")
+                    # Place Breakeven Stop on remaining position
+                    try:
+                        import ccxt
+                        exchange = ccxt.binance({
+                            'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
+                            'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
+                            'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+                        })
+                        exchange.load_time_difference()
+                        ccxt_sym = sym.replace('USDT', '/USDT:USDT')
+                        exchange.create_order(
+                            symbol=ccxt_sym,
+                            type='STOP_MARKET',
+                            side=close_side.lower(),
+                            amount=abs(amt),
+                            params={'stopPrice': float(be_str), 'positionSide': side}
+                        )
+                    except Exception:
+                        sl_params = {
+                            'symbol': sym,
+                            'side': close_side,
+                            'type': 'STOP_MARKET',
+                            'stopPrice': be_str,
+                            'closePosition': 'true',
+                            'positionSide': side
+                        }
+                        binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
+
+                    target['tp1_hit'] = True
+                    target['trailing_active'] = True
+                    target['current_sl'] = be_price
+                    target['highest_mark'] = mark_p
+                    target['lowest_mark'] = mark_p
+                    print(f"🎯 [TP1 33% SCALED OUT] #{sym} reached TP1! SL moved to Breakeven (${be_str}) — 100% Risk Free! 🚀", flush=True)
+                    send_telegram_msg(f"🎯 <b>STAGE 1: TP1 SCALED OUT (33% PROFIT LOCKED)</b>\n\n• Asset: <b>#{sym}</b> ({side})\n• Mark Price: <b>${mark_p:,.4f}</b>\n• New Stop: <b>${be_str}</b> (Breakeven Locked 🔒)\n\n<i>🌊 Stop is now 100% Risk-Free. Stage 2 TP2 & TP3 Runner Active!</i>")
+                    continue
+
+            # --- STAGE 2: Detect TP2 Hit (Additional 33% Scale-Out) ---
+            if target.get('tp1_hit') and not target.get('tp2_hit') and tp2_p > 0:
+                hit_tp2 = (side == 'LONG' and mark_p >= tp2_p) or (side == 'SHORT' and mark_p <= tp2_p)
+                if hit_tp2:
+                    scale2_qty = round(target['initial_qty'] * 0.33, qty_prec)
+                    if qty_prec == 0:
+                        scale2_qty = int(scale2_qty)
+                    scale2_qty = min(scale2_qty, abs(amt) * 0.90)
+
+                    if scale2_qty > 0 and (scale2_qty * mark_p >= 5.05):
+                        scale2_str = str(int(scale2_qty)) if qty_prec == 0 else f"{scale2_qty:.{qty_prec}f}"
+                        # Market close 33% at TP2
+                        try:
+                            import ccxt
+                            exchange = ccxt.binance({
+                                'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
+                                'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
+                                'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+                            })
+                            exchange.load_time_difference()
+                            ccxt_sym = sym.replace('USDT', '/USDT:USDT')
+                            exchange.create_order(
+                                symbol=ccxt_sym,
+                                type='MARKET',
+                                side=close_side.lower(),
+                                amount=float(scale2_str),
+                                params={'positionSide': side}
+                            )
+                        except Exception:
+                            tp2_params = {
+                                'symbol': sym,
+                                'side': close_side,
+                                'type': 'MARKET',
+                                'quantity': scale2_str,
+                                'positionSide': side
+                            }
+                            binance_futures_signed_request('POST', '/fapi/v1/order', tp2_params)
+
+                    target['tp2_hit'] = True
+                    # Tighten trailing stop distance on final 34% runner
+                    tight_sl = (target['highest_mark'] - (0.8 * atr_val)) if side == 'LONG' else (target['lowest_mark'] + (0.8 * atr_val))
+                    if (side == 'LONG' and tight_sl > target['current_sl']) or (side == 'SHORT' and tight_sl < target['current_sl']):
+                        target['current_sl'] = tight_sl
+
+                    print(f"🎯🎯 [TP2 33% SCALED OUT] #{sym} reached TP2! Major profit locked! Trailing stop tightened! 🚀", flush=True)
+                    send_telegram_msg(f"🎯🎯 <b>STAGE 2: TP2 SCALED OUT (66% TOTAL PROFIT LOCKED)</b>\n\n• Asset: <b>#{sym}</b> ({side})\n• Mark Price: <b>${mark_p:,.4f}</b>\n\n<i>🏃 Final 34% TP3 Runner trailing stop tightened to ride macro trend!</i>")
+                    continue
+
+            # --- STAGE 3: Dynamic TP3 Trailing Stop on the Final Runner ---
+            if target.get('trailing_active'):
+                trail_distance = 0.8 * atr_val if target.get('tp2_hit') else 1.2 * atr_val
+
+                if side == 'LONG':
+                    if mark_p > target['highest_mark']:
+                        target['highest_mark'] = mark_p
+                    
+                    calc_trail = target['highest_mark'] - trail_distance
+                    if calc_trail > (target['current_sl'] + (0.25 * atr_val)) and calc_trail > entry_p:
+                        trail_str = f"{calc_trail:.{price_prec}f}"
+                        cancel_binance_symbol_all_orders(sym)
+                        
+                        try:
+                            import ccxt
+                            exchange = ccxt.binance({
+                                'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
+                                'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
+                                'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+                            })
+                            exchange.load_time_difference()
+                            ccxt_sym = sym.replace('USDT', '/USDT:USDT')
+                            exchange.create_order(
+                                symbol=ccxt_sym,
+                                type='STOP_MARKET',
+                                side=close_side.lower(),
+                                amount=abs(amt),
+                                params={'stopPrice': float(trail_str), 'positionSide': side}
+                            )
+                        except Exception:
+                            sl_params = {
+                                'symbol': sym,
+                                'side': close_side,
+                                'type': 'STOP_MARKET',
+                                'stopPrice': trail_str,
+                                'closePosition': 'true',
+                                'positionSide': side
+                            }
+                            binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
+
+                        target['current_sl'] = calc_trail
+                        print(f"📈 [TRAILING STOP TRAILED UP] #{sym} (LONG) -> New Stop Loss: ${trail_str} (Peak: ${target['highest_mark']:,.4f})", flush=True)
+
+                elif side == 'SHORT':
+                    if mark_p < target['lowest_mark']:
+                        target['lowest_mark'] = mark_p
+                    
+                    calc_trail = target['lowest_mark'] + trail_distance
+                    if calc_trail < (target['current_sl'] - (0.25 * atr_val)) and calc_trail < entry_p:
+                        trail_str = f"{calc_trail:.{price_prec}f}"
+                        cancel_binance_symbol_all_orders(sym)
+                        
+                        try:
+                            import ccxt
+                            exchange = ccxt.binance({
+                                'apiKey': os.getenv('BINANCE_API_KEY', BINANCE_API_KEY),
+                                'secret': os.getenv('BINANCE_API_SECRET', BINANCE_API_SECRET),
+                                'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+                            })
+                            exchange.load_time_difference()
+                            ccxt_sym = sym.replace('USDT', '/USDT:USDT')
+                            exchange.create_order(
+                                symbol=ccxt_sym,
+                                type='STOP_MARKET',
+                                side=close_side.lower(),
+                                amount=abs(amt),
+                                params={'stopPrice': float(trail_str), 'positionSide': side}
+                            )
+                        except Exception:
+                            sl_params = {
+                                'symbol': sym,
+                                'side': close_side,
+                                'type': 'STOP_MARKET',
+                                'stopPrice': trail_str,
+                                'closePosition': 'true',
+                                'positionSide': side
+                            }
+                            binance_futures_signed_request('POST', '/fapi/v1/order', sl_params)
+
+                        target['current_sl'] = calc_trail
+                        print(f"📉 [TRAILING STOP TRAILED DOWN] #{sym} (SHORT) -> New Stop Loss: ${trail_str} (Trough: ${target['lowest_mark']:,.4f})", flush=True)
+
     except Exception as e:
         pass
 
@@ -1168,6 +1637,10 @@ def place_binance_futures_market_order(symbol="XRPUSDT", side="BUY", trade_usdt=
         print(f"[BINANCE REJECTED ORDER] {symbol} {side} Error: {res.get('msg')} (code: {res.get('code')})", flush=True)
     elif isinstance(res, dict) and 'orderId' in res:
         print(f"[BINANCE ORDER FILLED] #{symbol} {side} Order ID: #{res.get('orderId')} | Status: {res.get('status', 'FILLED')}", flush=True)
+        # Update Staggered Entry Cooldown Timestamp
+        global LAST_ENTRY_TIMESTAMPS
+        dir_k = 'BUY' if side.upper() in ['BUY', 'LONG'] else 'SELL'
+        LAST_ENTRY_TIMESTAMPS[dir_k] = time.time()
 
     if isinstance(res, dict) and 'orderId' in res and (atr is not None or custom_tp is not None or custom_sl is not None):
         tp_sl_info = place_binance_futures_tp_sl(
@@ -1187,10 +1660,17 @@ def place_binance_futures_market_order(symbol="XRPUSDT", side="BUY", trade_usdt=
 # --------------------------------------------------------------------------
 # Telegram Notifications & Interactive Inline Keyboards (1-Tap Buttons)
 # --------------------------------------------------------------------------
-def get_telegram_inline_keyboard():
-    """Builds interactive clickable 1-tap buttons for Telegram"""
+def get_telegram_inline_keyboard(live_trading=None):
+    """Builds interactive clickable 1-tap buttons for Telegram with 1-Tap Live/Paper Toggle"""
+    live_btn_text = "🟢 LIVE TRADING (Active)" if live_trading is True else "🟢 Switch to LIVE"
+    paper_btn_text = "🟡 PAPER MODE (Active)" if live_trading is False else "🟡 Switch to PAPER"
+    
     return {
         "inline_keyboard": [
+            [
+                {"text": live_btn_text, "callback_data": "/live"},
+                {"text": paper_btn_text, "callback_data": "/paper"}
+            ],
             [
                 {"text": "📊 Live Status", "callback_data": "/status"},
                 {"text": "📈 Open Positions", "callback_data": "/positions"}
@@ -1204,7 +1684,8 @@ def get_telegram_inline_keyboard():
                 {"text": "▶️ Resume Engine", "callback_data": "/resume"}
             ],
             [
-                {"text": "🛑 EMERGENCY CLOSE ALL", "callback_data": "/closeall"}
+                {"text": "🧹 Clean Orphan Orders", "callback_data": "/clean"},
+                {"text": "🛑 CLOSE ALL", "callback_data": "/closeall"}
             ]
         ]
     }
@@ -1306,7 +1787,7 @@ QUANT_PILLAR_WEIGHTS = {
 }
 
 class WeatherEnsembleBot:
-    def __init__(self, consensus_threshold=30, live_trading=False, trade_usdt=None, margin_pct=0.03, sizing_mode="margin", leverage=50, timeframe="15m", max_positions=5):
+    def __init__(self, consensus_threshold=30, live_trading=False, trade_usdt=None, margin_pct=0.03, sizing_mode="margin", leverage=50, timeframe="15m", max_positions=8, directional_cap=4):
         self.threshold = consensus_threshold
         self.timeframe = timeframe # '1m', '3m', '5m', '15m', '1h', '4h'
         self.total_models = len(MODEL_NAMES)
@@ -1315,7 +1796,8 @@ class WeatherEnsembleBot:
         self.margin_pct = margin_pct
         self.sizing_mode = sizing_mode
         self.leverage = leverage
-        self.max_active_positions = max_positions  # 5 concurrent positions
+        self.max_active_positions = max_positions  # 8 concurrent positions
+        self.max_directional_cap = directional_cap  # Max same-direction positions (default 4)
         self.paused = False
         self.ledger = []
         self.last_notified_bars = {}
@@ -1641,11 +2123,15 @@ class WeatherEnsembleBot:
         atr50_val = tr.rolling(50).mean().iloc[-1] if len(tr) >= 50 else atr14_val
         is_atr_expanded = atr14_val >= (atr50_val * 1.05)
 
+        # Upgrade 2: Check BTC ADX Market Volatility Regime
+        is_trending, adx_val, adx_desc = check_btc_adx_market_regime(adx_chop_threshold=20)
+        effective_threshold = 31 if not is_trending else self.threshold
+
         if not self.paused and not CIRCUIT_BREAKER.circuit_tripped and active_count < self.max_active_positions:
             # Channel 0: 📐 Objective Fibonacci Golden Pocket Trigger (0.500 - 0.618 Retracement)
             if fib_info.get('is_setup') and fib_info.get('rr', 0) >= 1.8:
                 target_side = fib_info['side']
-                smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, target_side)
+                smc_4h_ok, smc_bias_desc = check_macro_and_mss_bias(symbol, target_side)
                 ob_ok, ob_ratio, _, _ = check_order_book_imbalance(symbol, target_side)
                 funding_ok, funding_rate = check_funding_rate(symbol, target_side)
 
@@ -1656,17 +2142,18 @@ class WeatherEnsembleBot:
                     of_desc = fib_info['desc']
                     print(f"[FIBONACCI GOLDEN POCKET AUTO-{target_side}] {symbol} 0.618 Entry @ ${fib_info['entry_price']:.4f} | TP1: ${fib_info['tp1']:.4f} | TP2: ${fib_info['tp2']:.4f} | SL: ${fib_info['sl']:.4f} (R:R {fib_info['rr']:.2f}) 📐", flush=True)
 
-            # Channel 1: 31-Model Quant Consensus (≥ 30/31) + Pillar Validation (≥ 7/9)
-            elif max_consensus >= self.threshold:
-                target_side = 'BUY' if bull_count >= self.threshold else 'SELL'
+            # Channel 1: 31-Model Quant Consensus + Pillar Validation
+            elif max_consensus >= effective_threshold:
+                target_side = 'BUY' if bull_count >= effective_threshold else 'SELL'
                 # Pillar-level independence gate: prevents correlated models from inflating consensus
-                pillar_ok = pillar_consensus >= 7
+                min_pillars_req = 9 if not is_trending else 7
+                pillar_ok = pillar_consensus >= min_pillars_req
                 if not pillar_ok:
-                    print(f"[FILTERED PILLAR] {symbol} {target_side} raw consensus {max_consensus}/31 but only {pillar_consensus}/9 pillars agree (need ≥ 7/9).", flush=True)
+                    print(f"[FILTERED PILLAR] {symbol} {target_side} raw consensus {max_consensus}/31 but only {pillar_consensus}/9 pillars agree (need ≥ {min_pillars_req}/9).", flush=True)
                 else:
                     ob_ok, ob_ratio, _, _ = check_order_book_imbalance(symbol, target_side)
                     funding_ok, funding_rate = check_funding_rate(symbol, target_side)
-                    smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, target_side)
+                    smc_4h_ok, smc_bias_desc = check_macro_and_mss_bias(symbol, target_side)
                     of_ok, of_desc, of_delta_pct, of_abs = check_order_flow_absorption(symbol, target_side)
 
                     if ob_ok and funding_ok and smc_4h_ok and of_ok and is_vol_surge and is_atr_expanded:
@@ -1697,7 +2184,7 @@ class WeatherEnsembleBot:
                         if not of_ok:
                             print(f"[FILTERED ORDER FLOW] {symbol} {target_side} consensus reached ({max_consensus}/31) but Order Flow opposes ({of_desc}).", flush=True)
                         if not smc_4h_ok:
-                            print(f"[FILTERED SMC 4H] {symbol} {target_side} consensus reached ({max_consensus}/31) but opposes 4H Macro Bias: {smc_bias_desc}.", flush=True)
+                            print(f"[FILTERED SMC/MSS] {symbol} {target_side} consensus reached ({max_consensus}/31) but opposes Macro Bias: {smc_bias_desc}.", flush=True)
                         if not ob_ok:
                             print(f"[FILTERED OB] {symbol} {target_side} consensus reached ({max_consensus}/31) but Order Book Imbalance failed ({ob_ratio}x < 1.05x).", flush=True)
                         if not funding_ok:
@@ -1705,7 +2192,7 @@ class WeatherEnsembleBot:
 
             # Channel 2: RSI + CCI Dual Divergence Sniper Trigger (High Conviction Lead + Confirm)
             elif bull_div:
-                smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, 'BUY')
+                smc_4h_ok, smc_bias_desc = check_macro_and_mss_bias(symbol, 'BUY')
                 if smc_4h_ok:
                     action = 'BUY'
                     trade_custom_tp = potato_info.get('resistance')
@@ -1714,7 +2201,7 @@ class WeatherEnsembleBot:
                     print(f"[DUAL DIVERGENCE AUTO-BUY] {symbol} RSI+CCI Bullish Divergence in 4H Uptrend | TP Target: ${trade_custom_tp:.4f} 🟢", flush=True)
 
             elif bear_div:
-                smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, 'SELL')
+                smc_4h_ok, smc_bias_desc = check_macro_and_mss_bias(symbol, 'SELL')
                 if smc_4h_ok:
                     action = 'SELL'
                     trade_custom_tp = potato_info.get('support')
@@ -1724,8 +2211,8 @@ class WeatherEnsembleBot:
 
             # Channel 3: ICT Turtle Soup Liquidity Sweep & Automated Potato S&R Bounce
             elif "SWEEP_SUPPORT_CONFIRMED" in potato_state or "TAPPING_SUPPORT_FLOOR" in potato_state:
-                # Tapped/Swept Floor -> MUST check if 4H Macro is UPTREND
-                smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, 'BUY')
+                # Tapped/Swept Floor -> MUST check if Macro is UPTREND
+                smc_4h_ok, smc_bias_desc = check_macro_and_mss_bias(symbol, 'BUY')
                 if smc_4h_ok:
                     action = 'BUY'
                     trade_custom_tp = potato_info.get('resistance') # Target: Resistance Ceiling 🧱
@@ -1734,11 +2221,11 @@ class WeatherEnsembleBot:
                     of_desc = f"🛡️ {'ICT Turtle Soup Liquidity Grab' if is_sweep else 'Potato Floor Bounce'} -> TP at Ceiling (${trade_custom_tp:.4f})"
                     print(f"[POTATO S&R {'TURTLE SOUP SWEEP' if is_sweep else 'AUTO-BUY'}] {symbol} @ Floor in 4H Uptrend | TP Target: ${trade_custom_tp:.4f} (Ceiling) 🟢", flush=True)
                 else:
-                    print(f"[POTATO S&R SKIPPED] {symbol} tapped Floor @ ${potato_info.get('support', 0):.4f} but 4H Macro is Downtrend (Avoid Falling Knife) 🛑", flush=True)
+                    print(f"[POTATO S&R SKIPPED] {symbol} tapped Floor @ ${potato_info.get('support', 0):.4f} but Macro is Downtrend (Avoid Falling Knife) 🛑", flush=True)
 
             elif "SWEEP_RESISTANCE_CONFIRMED" in potato_state or "TAPPING_RESISTANCE_CEILING" in potato_state:
-                # Tapped/Swept Ceiling -> MUST check if 4H Macro is DOWNTREND
-                smc_4h_ok, smc_bias_desc = check_4h_smc_bias(symbol, 'SELL')
+                # Tapped/Swept Ceiling -> MUST check if Macro is DOWNTREND
+                smc_4h_ok, smc_bias_desc = check_macro_and_mss_bias(symbol, 'SELL')
                 if smc_4h_ok:
                     action = 'SELL'
                     trade_custom_tp = potato_info.get('support') # Target: Support Floor 🛡️
@@ -1747,7 +2234,7 @@ class WeatherEnsembleBot:
                     of_desc = f"🧱 {'ICT Turtle Soup Liquidity Grab' if is_sweep else 'Potato Ceiling Bounce'} -> TP at Floor (${trade_custom_tp:.4f})"
                     print(f"[POTATO S&R {'TURTLE SOUP SWEEP' if is_sweep else 'AUTO-SELL'}] {symbol} @ Ceiling in 4H Downtrend | TP Target: ${trade_custom_tp:.4f} (Floor) 🔴", flush=True)
                 else:
-                    print(f"[POTATO S&R SKIPPED] {symbol} tapped Ceiling @ ${potato_info.get('resistance', 0):.4f} but 4H Macro is Uptrend (Avoid Shorting Bull Trend) 🛑", flush=True)
+                    print(f"[POTATO S&R SKIPPED] {symbol} tapped Ceiling @ ${potato_info.get('resistance', 0):.4f} but Macro is Uptrend (Avoid Shorting Bull Trend) 🛑", flush=True)
 
         # Minimum Structural 1.8 R:R Clearance Gate
         if action != 'NO TRADE' and trade_custom_tp and trade_custom_sl:
@@ -1759,7 +2246,21 @@ class WeatherEnsembleBot:
                 print(f"[FILTERED R:R RATIO] {symbol} {action} cancelled: Structural R:R {rr_ratio:.2f} < 1.8x minimum requirement.", flush=True)
                 action = 'NO TRADE'
 
-        # 👑 BTC Master Beta Filter & 🔒 6% Portfolio Margin Cap Confirmation
+        # ADX(14) Anti-Chop Gate (Pause when ADX < 22.0)
+        if action != 'NO TRADE' and len(df) >= 30:
+            sym_adx = calc_adx_series(df['high'].values, df['low'].values, df['close'].values, period=14)
+            if sym_adx < 22.0:
+                print(f"[FILTERED ADX CHOP] {symbol} {action} cancelled: Symbol ADX({sym_adx:.1f}) < 22.0 (Market in Chop Zone 🛑)", flush=True)
+                action = 'NO TRADE'
+
+        # Upgrade 3: Sector & Directional Exposure Cap (Correlation Protection)
+        if action != 'NO TRADE' and self.live_trading:
+            dir_ok, same_dir_cnt, dir_desc = check_directional_portfolio_cap(symbol, action, max_same_dir=3, max_per_sector=2)
+            if not dir_ok:
+                print(f"[FILTERED DIRECTIONAL/SECTOR CAP] {symbol} {action} cancelled: {dir_desc}", flush=True)
+                action = 'NO TRADE'
+
+        # 👑 BTC Master Beta Filter & 🔒 Portfolio Margin Cap Confirmation
         if action != 'NO TRADE' and symbol != 'BTCUSDT':
             btc_ok, btc_desc = check_btc_macro_health(action)
             if not btc_ok:
@@ -1769,7 +2270,8 @@ class WeatherEnsembleBot:
         if action != 'NO TRADE' and self.live_trading:
             usdt_bal = get_binance_futures_usdt_balance()
             est_margin = usdt_bal * self.margin_pct
-            port_ok, port_desc = check_portfolio_risk_capacity(usdt_bal, est_margin, max_portfolio_margin_pct=0.06)
+            max_port_margin = max(0.25, self.max_active_positions * self.margin_pct * 1.1)
+            port_ok, port_desc = check_portfolio_risk_capacity(usdt_bal, est_margin, max_portfolio_margin_pct=max_port_margin)
             if not port_ok:
                 print(f"[FILTERED PORTFOLIO CAP] {symbol} {action} cancelled: {port_desc}", flush=True)
                 action = 'NO TRADE'
@@ -1911,53 +2413,86 @@ class WeatherEnsembleBot:
         parts = text.split()
 
         if cmd in ['/start', '/help', '/menu']:
+            mode_tag = "🟢 <b>REAL MONEY LIVE TRADING ACTIVE</b>" if self.live_trading else "🟡 <b>PAPER MONITORING ACTIVE</b>"
             help_msg = (
-                f"🤖 <b>WEATHER-ENSEMBLE AI 30X RECOVERY C2 MENU</b>\n\n"
-                f"Use the 1-tap buttons below or type commands:\n"
+                f"🤖 <b>WEATHER-ENSEMBLE AI TRADING C2 CONTROL</b>\n"
+                f"Current Mode: {mode_tag}\n\n"
+                f"<b>1-Tap Fast Actions:</b>\n"
+                f"• Tap <b>🟢 Switch to LIVE</b> to activate real Binance execution.\n"
+                f"• Tap <b>🟡 Switch to PAPER</b> to switch to signals/monitoring only.\n"
                 f"• <b>/status</b> - View live balance, leverage & engine state.\n"
-                f"• <b>/positions</b> - View all active Binance Futures open positions & PnL.\n"
+                f"• <b>/positions</b> - View all active Binance Futures positions & PnL.\n"
                 f"• <b>/circuit</b> - View daily circuit breaker & drawdown status.\n"
-                f"• <b>/closeall</b> - Emergency market close all open futures positions.\n"
+                f"• <b>/clean</b> - Manually purge leftover/orphaned orders.\n"
+                f"• <b>/closeall</b> - Emergency market close all open positions.\n"
                 f"• <b>/tf &lt;1m|3m|5m|15m|1h|4h&gt;</b> - Change execution timeframe.\n"
-                f"• <b>/models</b> - Real-time consensus breakdown for all 19 coins.\n"
+                f"• <b>/models</b> - Real-time consensus breakdown for all 14 coins.\n"
                 f"• <b>/margin N</b> - Set capital risk percentage (e.g. <code>/margin 3</code>).\n"
                 f"• <b>/leverage N</b> - Set leverage multiplier (e.g. <code>/leverage 50</code>).\n"
-                f"• <b>/maxpos N</b> - Set max concurrent positions (e.g. <code>/maxpos 2</code>).\n"
+                f"• <b>/maxpos N</b> - Set max concurrent positions (e.g. <code>/maxpos 8</code>).\n"
+                f"• <b>/dircap N</b> - Set max same-direction positions (e.g. <code>/dircap 4</code>).\n"
                 f"• <b>/threshold N</b> - Set consensus threshold (e.g. <code>/threshold 30</code>)."
             )
-            send_telegram_msg(help_msg, reply_markup=get_telegram_inline_keyboard())
+            send_telegram_msg(help_msg, reply_markup=get_telegram_inline_keyboard(self.live_trading))
+
+        elif cmd in ['/live', '/mode_live', '/real']:
+            self.live_trading = True
+            usdt_bal = get_binance_futures_usdt_balance()
+            msg = (
+                f"🟢 <b>SWITCHED TO LIVE TRADING (REAL MONEY)</b> 🚀\n\n"
+                f"• <b>Status:</b> Real Order Execution ACTIVE on Binance Futures\n"
+                f"• <b>Wallet Balance:</b> ${usdt_bal:,.2f} USDT\n"
+                f"• <b>Risk per Trade:</b> {self.margin_pct * 100:.1f}% Margin @ {self.leverage}x Leverage\n"
+                f"• <b>Directional Cap:</b> Max {self.max_directional_cap} Same-Side Positions\n"
+                f"• <b>Scale-Out Engine:</b> 33% TP1 ➔ BE SL ➔ 33% TP2 ➔ 34% TP3 Runner 🌊\n\n"
+                f"<i>The bot will now automatically execute real orders on high-confluence signals.</i>"
+            )
+            send_telegram_msg(msg, reply_markup=get_telegram_inline_keyboard(self.live_trading))
+            print(f"\n[TELEGRAM C2] 🟢 USER SWITCHED TO LIVE TRADING (REAL BINANCE EXECUTION ACTIVE)\n", flush=True)
+
+        elif cmd in ['/paper', '/mode_paper', '/test', '/monitor']:
+            self.live_trading = False
+            msg = (
+                f"🟡 <b>SWITCHED TO PAPER MONITORING (SIGNALS ONLY)</b> 📝\n\n"
+                f"• <b>Status:</b> Real Order Placement PAUSED\n"
+                f"• <b>Signals & Alerts:</b> Still active and scanning all 14 pairs\n"
+                f"• <b>Position Manager:</b> Still monitoring & protecting existing Binance positions\n\n"
+                f"<i>No new real money market orders will be placed until switched back to LIVE.</i>"
+            )
+            send_telegram_msg(msg, reply_markup=get_telegram_inline_keyboard(self.live_trading))
+            print(f"\n[TELEGRAM C2] 🟡 USER SWITCHED TO PAPER MONITORING MODE\n", flush=True)
 
         elif cmd == '/tf':
             if len(parts) > 1 and parts[1].lower() in ['1m', '3m', '5m', '15m', '30m', '1h', '4h']:
                 self.timeframe = parts[1].lower()
-                send_telegram_msg(f"⏱️ <b>EXECUTION TIMEFRAME SWITCHED</b>\n\nBot is now scanning <b>{self.timeframe.upper()}</b> bars for high-confluence setups!", reply_markup=get_telegram_inline_keyboard())
+                send_telegram_msg(f"⏱️ <b>EXECUTION TIMEFRAME SWITCHED</b>\n\nBot is now scanning <b>{self.timeframe.upper()}</b> bars for high-confluence setups!", reply_markup=get_telegram_inline_keyboard(self.live_trading))
             else:
-                send_telegram_msg(f"ℹ️ Current Execution Timeframe: <b>{self.timeframe.upper()}</b>\nUsage: <code>/tf 15m</code> (Supported: 1m, 3m, 5m, 15m, 1h, 4h)", reply_markup=get_telegram_inline_keyboard())
+                send_telegram_msg(f"ℹ️ Current Execution Timeframe: <b>{self.timeframe.upper()}</b>\nUsage: <code>/tf 15m</code> (Supported: 1m, 3m, 5m, 15m, 1h, 4h)", reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd == '/status':
             usdt_bal = get_binance_futures_usdt_balance()
             status_str = "PAUSED ⏸️" if self.paused else ("CIRCUIT TRIPPED 🛑" if CIRCUIT_BREAKER.circuit_tripped else "ACTIVE 🟢")
-            mode_str = "REAL BINANCE FUTURES" if self.live_trading else "PAPER MONITOR"
+            mode_str = "🟢 REAL BINANCE FUTURES" if self.live_trading else "🟡 PAPER MONITOR (Signals Only)"
             active_cnt = get_binance_futures_open_positions_count()
 
             msg = (
                 f"📊 <b>ENGINE STATUS & WALLET REPORT</b>\n\n"
-                f"<b>Engine State:</b> {status_str}\n"
                 f"<b>Trading Mode:</b> {mode_str}\n"
+                f"<b>Engine State:</b> {status_str}\n"
                 f"<b>Binance Futures USDT Balance:</b> ${usdt_bal:,.2f}\n"
-                f"<b>Open Positions:</b> {active_cnt} / {self.max_active_positions}\n"
+                f"<b>Open Positions:</b> {active_cnt} / {self.max_active_positions} (Max {self.max_directional_cap} same-side)\n"
                 f"<b>Position Sizing:</b> {self.margin_pct * 100:.1f}% Capital (${usdt_bal * self.margin_pct:,.2f} Margin @ {self.leverage}x)\n"
-                f"<b>Current Consensus Threshold:</b> ≥ <b>{self.threshold} / 31 Models</b>\n"
-                f"<b>Circuit Breaker Status:</b> {'🛑 TRIPPED' if CIRCUIT_BREAKER.circuit_tripped else '🟢 HEALTHY'}\n"
-                f"<b>Monitored Assets:</b> {len(OPTIMIZED_SYMBOLS)} Micro-Lot Symbols\n"
+                f"<b>Consensus Threshold:</b> ≥ <b>{self.threshold} / 31 Models</b>\n"
+                f"<b>Circuit Breaker:</b> {'🛑 TRIPPED' if CIRCUIT_BREAKER.circuit_tripped else '🟢 HEALTHY'}\n"
+                f"<b>Monitored Universe:</b> {len(OPTIMIZED_SYMBOLS)} Liquid Assets\n"
                 f"<b>Timestamp:</b> {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
             )
-            send_telegram_msg(msg, reply_markup=get_telegram_inline_keyboard())
+            send_telegram_msg(msg, reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd == '/positions':
             positions = get_binance_futures_positions()
             if not positions:
-                send_telegram_msg("ℹ️ <b>No open Binance Futures positions.</b>", reply_markup=get_telegram_inline_keyboard())
+                send_telegram_msg("ℹ️ <b>No open Binance Futures positions.</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
             else:
                 lines = [f"📈 <b>OPEN BINANCE FUTURES POSITIONS ({len(positions)})</b>\n"]
                 for p in positions:
@@ -1969,7 +2504,7 @@ class WeatherEnsembleBot:
                         f"  Mark: ${p['markPrice']:,.4f} | Liq: ${p['liquidationPrice']:,.4f}\n"
                         f"  Unrealized PnL: <b>{pnl_color}${p['unrealizedProfit']:,.2f} USDT</b>\n"
                     )
-                send_telegram_msg("\n".join(lines), reply_markup=get_telegram_inline_keyboard())
+                send_telegram_msg("\n".join(lines), reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd == '/circuit':
             bal = get_binance_futures_usdt_balance()
@@ -1987,30 +2522,37 @@ class WeatherEnsembleBot:
             )
             if len(parts) > 1 and parts[1].lower() == 'reset':
                 CIRCUIT_BREAKER.reset_circuit(bal)
-                send_telegram_msg("✅ <b>Circuit breaker reset. Trading restored!</b>", reply_markup=get_telegram_inline_keyboard())
+                send_telegram_msg("✅ <b>Circuit breaker reset. Trading restored!</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
             else:
-                send_telegram_msg(msg, reply_markup=get_telegram_inline_keyboard())
+                send_telegram_msg(msg, reply_markup=get_telegram_inline_keyboard(self.live_trading))
+
+        elif cmd in ['/clean', '/cleanup', '/purge']:
+            cleaned = cleanup_orphaned_orders()
+            if cleaned > 0:
+                send_telegram_msg(f"🧹 <b>Purge Complete!</b> Cleaned {cleaned} orphaned orders.", reply_markup=get_telegram_inline_keyboard(self.live_trading))
+            else:
+                send_telegram_msg("✨ <b>No orphaned orders found.</b> All open orders match active positions!", reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd == '/closeall':
             results = close_all_binance_futures_positions()
             cleanup_orphaned_orders()
-            send_telegram_msg(f"🛑 <b>Emergency Close All executed!</b> Closed {len(results)} positions.", reply_markup=get_telegram_inline_keyboard())
+            send_telegram_msg(f"🛑 <b>Emergency Close All executed!</b> Closed {len(results)} positions.", reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd in ['/leverage', '/lev']:
             if len(parts) > 1 and parts[1].isdigit():
                 val = int(parts[1])
                 if 1 <= val <= 125:
                     self.leverage = val
-                    send_telegram_msg(f"✅ <b>Leverage multiplier updated to {self.leverage}x!</b>", reply_markup=get_telegram_inline_keyboard())
+                    send_telegram_msg(f"✅ <b>Leverage multiplier updated to {self.leverage}x!</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
                 else:
                     send_telegram_msg("⚠️ Leverage must be between 1x and 125x.")
             else:
-                send_telegram_msg(f"Current Leverage: <b>{self.leverage}x</b>", reply_markup=get_telegram_inline_keyboard())
+                send_telegram_msg(f"Current Leverage: <b>{self.leverage}x</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd in ['/mode', '/sizing']:
             if len(parts) > 1 and parts[1].lower() in ['notional', 'margin']:
                 self.sizing_mode = parts[1].lower()
-                send_telegram_msg(f"✅ <b>Sizing Mode updated to {self.sizing_mode.upper()}!</b>", reply_markup=get_telegram_inline_keyboard())
+                send_telegram_msg(f"✅ <b>Sizing Mode updated to {self.sizing_mode.upper()}!</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
             else:
                 send_telegram_msg("Usage: <code>/mode notional</code> or <code>/mode margin</code>")
 
@@ -2020,42 +2562,53 @@ class WeatherEnsembleBot:
                     val = float(parts[1])
                     if 0 < val <= 100:
                         self.margin_pct = val / 100.0
-                        send_telegram_msg(f"✅ <b>Position Risk updated to {self.margin_pct * 100:.1f}%!</b>", reply_markup=get_telegram_inline_keyboard())
+                        send_telegram_msg(f"✅ <b>Position Risk updated to {self.margin_pct * 100:.1f}%!</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
                 except ValueError:
-                    send_telegram_msg("Usage: <code>/margin 20</code>")
+                    send_telegram_msg("Usage: <code>/margin 3</code>")
 
         elif cmd in ['/maxpos', '/maxpositions', '/slots']:
             if len(parts) > 1 and parts[1].isdigit():
                 val = int(parts[1])
                 if 1 <= val <= 20:
                     self.max_active_positions = val
-                    send_telegram_msg(f"✅ <b>Max Active Positions updated to {self.max_active_positions}!</b>", reply_markup=get_telegram_inline_keyboard())
+                    send_telegram_msg(f"✅ <b>Max Active Positions updated to {self.max_active_positions}!</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
                 else:
                     send_telegram_msg("⚠️ Max active positions must be between 1 and 20.")
             else:
-                send_telegram_msg(f"ℹ️ Current Max Active Positions: <b>{self.max_active_positions}</b>\nUsage: <code>/maxpos 2</code>", reply_markup=get_telegram_inline_keyboard())
+                send_telegram_msg(f"ℹ️ Current Max Active Positions: <b>{self.max_active_positions}</b>\nUsage: <code>/maxpos 8</code>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
+
+        elif cmd in ['/dircap', '/directionalcap', '/maxdir', '/sidecap']:
+            if len(parts) > 1 and parts[1].isdigit():
+                val = int(parts[1])
+                if 1 <= val <= 20:
+                    self.max_directional_cap = val
+                    send_telegram_msg(f"✅ <b>Directional Exposure Cap updated to {self.max_directional_cap} max same-side positions!</b> 🛡️", reply_markup=get_telegram_inline_keyboard(self.live_trading))
+                else:
+                    send_telegram_msg("⚠️ Directional cap must be between 1 and 20.")
+            else:
+                send_telegram_msg(f"ℹ️ Current Directional Exposure Cap: <b>{self.max_directional_cap} same-side positions</b>\nUsage: <code>/dircap 4</code>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd == '/models':
             lines = ["<b>31-MODEL REAL-TIME CONSENSUS MATRIX</b>\n"]
             for sym, data in self.latest_model_states.items():
                 emoji = "🟢 BUY" if data['action'] == 'BUY' else "🔴 SELL" if data['action'] == 'SELL' else "⚪ Hold"
                 lines.append(f"• <b>{sym}</b>: ${data['price']:,.4f} | <b>{data['consensus']}/31</b> ({data['bull']}B/{data['bear']}B) | {emoji}")
-            send_telegram_msg("\n".join(lines), reply_markup=get_telegram_inline_keyboard())
+            send_telegram_msg("\n".join(lines), reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd == '/threshold':
             if len(parts) > 1 and parts[1].isdigit():
                 val = int(parts[1])
                 if 20 <= val <= 31:
                     self.threshold = val
-                    send_telegram_msg(f"✅ <b>Consensus Threshold updated to {self.threshold} / 31 models!</b>", reply_markup=get_telegram_inline_keyboard())
+                    send_telegram_msg(f"✅ <b>Consensus Threshold updated to {self.threshold} / 31 models!</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd == '/pause':
             self.paused = True
-            send_telegram_msg("⏸️ <b>Automated trade execution PAUSED.</b>", reply_markup=get_telegram_inline_keyboard())
+            send_telegram_msg("⏸️ <b>Automated trade execution PAUSED.</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
         elif cmd == '/resume':
             self.paused = False
-            send_telegram_msg("▶️ <b>Automated trade execution RESUMED!</b>", reply_markup=get_telegram_inline_keyboard())
+            send_telegram_msg("▶️ <b>Automated trade execution RESUMED!</b>", reply_markup=get_telegram_inline_keyboard(self.live_trading))
 
     def run_multi_asset_live_loop(self, poll_interval=10):
         print(f"\n=======================================================")
@@ -2068,38 +2621,42 @@ class WeatherEnsembleBot:
         self.start_telegram_command_listener()
 
         while True:
-            # 1. Automated Orphaned Order Cleaner & Real-Time Breakeven Trailing Stop Daemon
-            if self.live_trading:
-                cleanup_orphaned_orders()
-                manage_active_positions_breakeven()
+            try:
+                # 1. Automated Orphaned Order Cleaner & Real-Time Breakeven Trailing Stop Daemon
+                if self.live_trading:
+                    cleanup_orphaned_orders()
+                    manage_active_positions_breakeven()
 
-            active_positions = get_binance_futures_positions() if self.live_trading else []
-            active_symbols = set(p['symbol'] for p in active_positions if abs(float(p.get('positionAmt', 0.0))) > 0.0)
-            active_count = len(active_symbols)
+                active_positions = get_binance_futures_positions() if self.live_trading else []
+                active_symbols = set(p['symbol'] for p in active_positions if abs(float(p.get('positionAmt', 0.0))) > 0.0)
+                active_count = len(active_symbols)
 
-            for symbol in OPTIMIZED_SYMBOLS:
-                # 🛑 1 Position Per Symbol Maximum: Skip symbols that already have an active open position
-                if symbol in active_symbols:
-                    continue
+                for symbol in OPTIMIZED_SYMBOLS:
+                    # 🛑 1 Position Per Symbol Maximum: Skip symbols that already have an active open position
+                    if symbol in active_symbols:
+                        continue
 
-                df = self.fetch_binance_klines(symbol=symbol)
-                if df is not None and len(df) >= 35:
-                    res = self.evaluate_bar(df, symbol=symbol, active_count=active_count)
-                    price = res['price']
-                    consensus = res['consensus']
-                    action = res['action']
-                    t_str = res['timestamp']
+                    df = self.fetch_binance_klines(symbol=symbol)
+                    if df is not None and len(df) >= 35:
+                        res = self.evaluate_bar(df, symbol=symbol, active_count=active_count)
+                        price = res['price']
+                        consensus = res['consensus']
+                        action = res['action']
+                        t_str = res['timestamp']
+                        
+                        if action != 'NO TRADE':
+                            active_symbols.add(symbol)
+                            active_count += 1
+                            print(f"[SIGNAL TRIGGERED] [{t_str}] [{symbol}] ${price:,.4f} | Consensus: {consensus}/31 | ACTION: {action}", flush=True)
+                        else:
+                            print(f"  [{t_str}] [{symbol}] ${price:,.4f} | Consensus: {consensus}/31 | Hold", flush=True)
                     
-                    if action != 'NO TRADE':
-                        active_symbols.add(symbol)
-                        active_count += 1
-                        print(f"[SIGNAL TRIGGERED] [{t_str}] [{symbol}] ${price:,.4f} | Consensus: {consensus}/31 | ACTION: {action}", flush=True)
-                    else:
-                        print(f"  [{t_str}] [{symbol}] ${price:,.4f} | Consensus: {consensus}/31 | Hold", flush=True)
-                
-                time.sleep(0.4)
+                    time.sleep(0.4)
 
-            time.sleep(poll_interval)
+                time.sleep(poll_interval)
+            except Exception as e:
+                print(f"[MAIN LOOP EXCEPTION RECOVERED] {e}", flush=True)
+                time.sleep(3)
 
 def get_divergence_status(symbol="XRPUSDT"):
     """Returns live RSI(14), CCI(20), and Dual Divergence State for symbol"""
@@ -2141,7 +2698,8 @@ if __name__ == '__main__':
     parser.add_argument('--leverage', type=int, default=50, help='Leverage multiplier (default 50x)')
     parser.add_argument('--threshold', type=int, default=30, help='Consensus threshold (default 30/31)')
     parser.add_argument('--timeframe', type=str, default='15m', help='Execution timeframe (default 15m)')
-    parser.add_argument('--max-positions', type=int, default=5, help='Max concurrent positions (default 5)')
+    parser.add_argument('--max-positions', type=int, default=8, help='Max concurrent positions (default 8)')
+    parser.add_argument('--directional-cap', type=int, default=4, help='Max same-side positions (default 4)')
     args = parser.parse_args()
 
     bot = WeatherEnsembleBot(
@@ -2152,9 +2710,18 @@ if __name__ == '__main__':
         sizing_mode=args.sizing_mode,
         leverage=args.leverage,
         timeframe=args.timeframe,
-        max_positions=args.max_positions
+        max_positions=args.max_positions,
+        directional_cap=args.directional_cap
     )
-    try:
-        bot.run_multi_asset_live_loop()
-    except KeyboardInterrupt:
-        print("\n🛑 Bot stopped cleanly by user.")
+    while True:
+        try:
+            bot.run_multi_asset_live_loop()
+        except KeyboardInterrupt:
+            print("\n🛑 Bot stopped cleanly by user.", flush=True)
+            break
+        except Exception as e:
+            print(f"\n[TOP LEVEL FATAL EXCEPTION] {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            print("Restarting live loop in 5 seconds...", flush=True)
+            time.sleep(5)
